@@ -1,0 +1,11 @@
+services:
+  glovee-api:
+    image: postgrest/postgrest
+    restart: always
+    ports:
+      - 80:3000
+    environment:
+      PGRST_DB_URI: ${PGRST_DB_URI}
+      PGRST_DB_SCHEMAS: ${PGRST_DB_SCHEMAS}
+      PGRST_DB_ANON_ROLE: ${PGRST_DB_ANON_ROLE}
+      PGRST_DB_PRE_REQUEST: ${PGRST_DB_PRE_REQUEST}
