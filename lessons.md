@@ -113,3 +113,23 @@ LIMIT 1000;
 - Sequential: Safe but slow
 - Batching: Better performance, more complex
 - Async Layer: Most flexible, requires architectural change
+
+
+## What does postgrest do exactly? what happens before each query (on eacg request)
+
+postgrest does this:
+This is an example of what postgrest runs before each query, from a log dump:
+```
+2024-10-27 20:09:58.281 UTC [36] LOG:  execute 14:
+select
+  set_config('search_path', $1, true),
+  set_config('role', $2, true),
+  set_config('request.jwt.claims', $3, true),
+  set_config('request.method', $4, true),
+  set_config('request.path', $5, true),
+  set_config('request.headers', $6, true),
+  set_config('request.cookies', $7, true)
+2024-10-27 20:09:58.281 UTC [36] DETAIL:
+  Parameters: $1 = '"api", "public"', $2 = 'web_anon', $3 = '{"role":"web_anon"}', $4 = 'GET', $5 = '/rpc/echo_postgrest_vars', $6 = '{"user-agent":"curl/8.10.1","host":"10.0.0.79:3000","accept":"*/*"}', $7 = '{}'
+```
+`select set_config('role', 'web_anon', true);` does the same thing as `set local role web_anon`
