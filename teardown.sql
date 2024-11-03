@@ -26,6 +26,7 @@ end$$;
 begin;
 -- Drop views
 drop view if exists api.organizations;
+drop view if exists api.clients;
 
 -- Drop AWS function for presigned URLs
 drop function if exists aws.generate_s3_presigned_url(text, text, text, text, int);
@@ -48,6 +49,7 @@ drop function if exists auth.refresh_tokens(text);
 drop function if exists auth.validate_refresh_tokens_input(text);
 drop function if exists auth.login(text, text, text);
 drop function if exists auth.validate_login_input(text, text, text);
+drop function if exists auth.current_user_organization_id();
 drop function if exists auth.verify(text, text, text);
 drop function if exists auth.try_cast_double(text);
 drop function if exists auth.sign(jsonb, text, text);
@@ -93,3 +95,4 @@ drop schema if exists aws cascade;
 drop role if exists authenticated;
 drop role if exists anon;
 commit;
+end;

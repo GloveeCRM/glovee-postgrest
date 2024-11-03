@@ -273,6 +273,14 @@ $$
   ) jwt
 $$;
 
+create or replace function auth.current_user_organization_id()
+returns bigint
+language sql
+as
+$$
+    select (nullif(current_setting('request.jwt.claims', true), '')::jsonb -> 'user' ->> 'organization_id')::bigint;
+$$;
+
 create function auth.validate_login_input(_email text, _password text, _org_name text) returns text
     language plpgsql
 as
@@ -306,7 +314,7 @@ begin
 end;
 $$;
 
-create function auth.login(_email text, _password text, _org_name text, OUT validation_failure_message text, OUT access_token text, OUT refresh_token text) returns record
+create or replace function auth.login(_email text, _password text, _org_name text, OUT validation_failure_message text, OUT access_token text, OUT refresh_token text) returns record
     language plpgsql
 as
 $$
@@ -359,6 +367,7 @@ begin
         'iat', extract(epoch from now())::int,
         'exp', extract(epoch from now())::int + _access_token_expiration::int,
         'token_type', 'access_token',
+        'role', 'authenticated',
         'user', jsonb_build_object(
             'user_id', _user.user_id,
             'email', _user.email,
@@ -934,6 +943,35 @@ from organizations.organization o
 left join files.file f on o.logo_file_id = f.file_id;
 
 grant select on api.organizations to anon;
+
+-- Clients
+create or replace view api.clients as
+select
+    u.user_id,
+    u.organization_id,
+    u.email,
+    u.first_name,
+    u.last_name,
+    u.role,
+    u.status,
+    case
+        when f.file_id is not null then
+            aws.generate_s3_presigned_url(
+                f.bucket,
+                f.object_key,
+                f.region,
+                'GET',
+                3600
+            )
+    end as profile_picture_url,
+    u.created_at,
+    u.updated_at
+from users.user u
+left join files.file f on u.profile_picture_file_id = f.file_id
+where u.role = 'org_client' and u.organization_id = auth.current_user_organization_id();
+
+grant select on api.clients to authenticated;
+
 commit;
 
 -- Seed the database
