@@ -194,3 +194,6 @@ references
 see below for parameters:
 - The list of parameters documents which cannot be hot-reloaded
 https://docs.postgrest.org/en/stable/references/configuration.html#config-full-list
+
+## The basic idea: there are many disconnects in PostgREST tutorial, AI chatbot suggestoons and othet resources online.
+- One of those disconnects I mentioned above. You can't figure out at first what is the connection between role that user has in JWT and the db role. why those role names? what checks thr privilages for that resource?
