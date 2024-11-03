@@ -617,10 +617,10 @@ begin
         status
     ) values (
         _organization_id,
-        _first_name,
-        _last_name,
         lower(_email),
         _hashed_password,
+        _first_name,
+        _last_name,
         _role,
         'active'
     ) returning * into _new_user;
