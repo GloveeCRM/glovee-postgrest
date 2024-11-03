@@ -119,8 +119,11 @@ LIMIT 1000;
 
 postgrest does this:
 This is an example of what postgrest runs before each query, from a log dump:
-```
+
+```sql
+2024-10-27 20:09:58.280 UTC [36] LOG:  execute 13: BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY
 2024-10-27 20:09:58.281 UTC [36] LOG:  execute 14:
+
 select
   set_config('search_path', $1, true),
   set_config('role', $2, true),
@@ -131,5 +134,63 @@ select
   set_config('request.cookies', $7, true)
 2024-10-27 20:09:58.281 UTC [36] DETAIL:
   Parameters: $1 = '"api", "public"', $2 = 'web_anon', $3 = '{"role":"web_anon"}', $4 = 'GET', $5 = '/rpc/echo_postgrest_vars', $6 = '{"user-agent":"curl/8.10.1","host":"10.0.0.79:3000","accept":"*/*"}', $7 = '{}'
+
+2024-10-27 20:09:58.283 UTC [36] LOG:  execute 15:
+
+WITH pgrst_source AS (
+  SELECT
+    pgrst_call.pgrst_scalar
+  FROM (
+    SELECT $1 AS json_data
+  ) pgrst_payload,
+  LATERAL (
+    SELECT "foo" FROM json_to_record(pgrst_payload.json_data) AS _("foo" text) LIMIT 1
+  ) pgrst_body,
+  LATERAL (
+    SELECT "api"."echo_postgrest_vars"("foo" := pgrst_body."foo") pgrst_scalar
+  ) pgrst_call
+)
+SELECT
+  null::bigint AS total_result_set,
+  1 AS page_total,
+  coalesce(json_agg(_postgrest_t.pgrst_scalar)->0, 'null') AS body,
+  nullif(current_setting('response.headers', true), '') AS response_headers,
+  nullif(current_setting('response.status', true), '') AS response_status,
+  '' AS response_inserted
+FROM (
+  SELECT "echo_postgrest_vars".* FROM "pgrst_source" AS "echo_postgrest_vars"
+) _postgrest_t
+2024-10-27 20:09:58.283 UTC [36] DETAIL:  Parameters: $1 = '{"foo":"bar"}'
+2024-10-27 20:09:58.283 UTC [36] LOG:  execute 2: COMMIT
 ```
-`select set_config('role', 'web_anon', true);` does the same thing as `set local role web_anon`
+
+# Note for self: put the above into small understandable examples rather than copy pasting the dump.
+
+## schema caching
+
+One of the things that I missed as a first timer and kept shutting postgres down and turn on again was schema caching.
+
+postgrest uses the postgres listen&notify pub/sub system to trigger reloading of the schema cache and the config
+https://docs.postgrest.org/en/stable/references/listener.html#listener
+(yes, that's right folks, postgresql has a built-in pub/sub system)
+
+```sql
+NOTIFY pgrst, 'reload schema'; -- reload schema cache
+NOTIFY pgrst, 'reload config'; -- reload config
+NOTIFY pgrst;                  -- reload both
+```
+What can happen in practice? When may I need to do this?
+
+- when you change the schema, say if you add a function, and postgrest has not realised the function exists yet.
+
+running the reload schema and config updates the api if it does not recognize the schema change so no need to shut postgrest doen when up.
+
+references
+- https://docs.postgrest.org/en/stable/references/schema_cache.html
+- https://docs.postgrest.org/en/stable/references/configuration.html#config-reloading
+
+### When would I need to shut down?
+- When you update any of the parameters that can not be hot reloaded.
+see below for parameters:
+- The list of parameters documents which cannot be hot-reloaded
+https://docs.postgrest.org/en/stable/references/configuration.html#config-full-list
