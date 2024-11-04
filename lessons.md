@@ -114,7 +114,6 @@ LIMIT 1000;
 - Batching: Better performance, more complex
 - Async Layer: Most flexible, requires architectural change
 
-
 ## What does postgrest do exactly? what happens before each query (on eacg request)
 
 postgrest does this:
@@ -179,6 +178,7 @@ NOTIFY pgrst, 'reload schema'; -- reload schema cache
 NOTIFY pgrst, 'reload config'; -- reload config
 NOTIFY pgrst;                  -- reload both
 ```
+
 What can happen in practice? When may I need to do this?
 
 - when you change the schema, say if you add a function, and postgrest has not realised the function exists yet.
@@ -186,14 +186,21 @@ What can happen in practice? When may I need to do this?
 running the reload schema and config updates the api if it does not recognize the schema change so no need to shut postgrest doen when up.
 
 references
+
 - https://docs.postgrest.org/en/stable/references/schema_cache.html
 - https://docs.postgrest.org/en/stable/references/configuration.html#config-reloading
 
 ### When would I need to shut down?
+
 - When you update any of the parameters that can not be hot reloaded.
-see below for parameters:
+  see below for parameters:
 - The list of parameters documents which cannot be hot-reloaded
-https://docs.postgrest.org/en/stable/references/configuration.html#config-full-list
+  https://docs.postgrest.org/en/stable/references/configuration.html#config-full-list
 
 ## The basic idea: there are many disconnects in PostgREST tutorial, AI chatbot suggestoons and othet resources online.
+
 - One of those disconnects I mentioned above. You can't figure out at first what is the connection between role that user has in JWT and the db role. why those role names? what checks thr privilages for that resource?
+
+## Search and pagination
+
+- Using views you can do search and pagination. However what was not so clear was how to get the total count of the search results. For that, you can easily just set the count parameter as exact in the header.

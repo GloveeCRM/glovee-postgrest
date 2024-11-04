@@ -953,6 +953,7 @@ select
     u.email,
     u.first_name,
     u.last_name,
+    concat(u.first_name, ' ', u.last_name) as full_name,
     u.role,
     u.status,
     case
