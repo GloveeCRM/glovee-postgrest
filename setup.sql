@@ -488,6 +488,7 @@ begin
     _new_access_token_claims := jsonb_build_object(
         'iat', extract(epoch from now())::int,
         'exp', extract(epoch from now())::int + _access_token_expiration::int,
+        'role', 'authenticated',
         'token_type', 'access_token',
         'user', jsonb_build_object(
             'user_id', _user.user_id,
