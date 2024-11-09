@@ -36,13 +36,15 @@ drop function if exists files.get_file_extension_from_mimetype(text);
 drop function if exists files.generate_object_key(bigint, text, text, text, bigint);
 
 -- Drop API functionss
-drop function if exists api.generate_s3_presigned_url(text, text, text, text, int);
+drop function if exists api.update_user_status(bigint, users.user_status);
 drop function if exists api.create_client(text, text, text, text);
 drop function if exists api.register_client(text, text, text, text, text);
 drop function if exists api.refresh_tokens(text);
 drop function if exists api.login(text, text, text);
 
 -- Drop user functions
+drop function if exists users.create_user_status(bigint, users.user_status);
+drop function if exists users.validate_create_user_status_input(bigint, users.user_status);
 drop function if exists users.create_user(text, text, text, text, text, users.user_role);
 drop function if exists users.validate_create_user_input(text, text, text, text, text, users.user_role);
 drop function if exists users.user_organization_id(bigint);

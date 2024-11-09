@@ -37,9 +37,12 @@ end
 $$;
 
 -- Grant permissions
-grant usage on schema api to anon;
-grant usage on schema api to authenticated;
-grant anon to authenticated;
+grant usage on schema 
+    api,
+    users,
+    auth,
+    aws
+to anon, authenticated;
 
 alter default privileges revoke execute on functions from public;
 
@@ -835,6 +838,64 @@ begin
 end;
 $$;
 
+create function users.validate_create_user_status_input(_user_id bigint, _status users.user_status) returns text
+    language plpgsql
+    security definer
+as
+$$
+begin
+    if _user_id is null then
+        return 'user_id_missing';
+    end if;
+
+    if _status not in ('active', 'inactive') then
+        return 'invalid_status';
+    end if;
+
+    if not exists (
+        select 1
+        from users.user
+        where user_id = _user_id and organization_id = auth.current_user_organization_id()
+    ) then
+        return 'user_not_found';
+    end if;
+
+    return null;
+end;
+$$;
+
+create or replace function users.create_user_status(
+    _user_id bigint,
+    _status users.user_status,
+    out validation_failure_message text,
+    out created_status users.account_status
+) returns record
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _inserted_status users.account_status;
+begin
+    validation_failure_message := users.validate_create_user_status_input(_user_id, _status);
+    if validation_failure_message is not null then
+        return;
+    end if;
+
+    insert into users.account_status (
+        user_id,
+        status
+    ) values (
+        _user_id,
+        _status
+    ) returning * into _inserted_status;
+
+    created_status := _inserted_status;
+
+    return;
+end;
+$$;
+
 -- AWS
 create or replace function aws.generate_s3_presigned_url(
     _bucket_name text,
@@ -881,6 +942,8 @@ begin
     return _url;
 end;
 $$;
+
+grant execute on function aws.generate_s3_presigned_url(text, text, text, text, int) to anon, authenticated;
 
 -- Files
 create or replace function files.get_file_extension_from_mimetype(_mime_type text)
@@ -1030,26 +1093,6 @@ end;
 $$;
 
 -- Api
-create or replace function api.generate_s3_presigned_url(
-    _bucket_name text,
-    _object_key text,
-    _region text,
-    _operation text default 'get',
-    _expires_in_seconds int default 3600
-) returns text
-    language plpgsql
-    security definer
-as $$
-declare
-    _url text;
-begin
-    _url := aws.generate_s3_presigned_url(_bucket_name, _object_key, _region, _operation, _expires_in_seconds);
-    return _url;
-end;
-$$;
-
-grant execute on function api.generate_s3_presigned_url(text, text, text, text, int) to anon, authenticated;
-
 create function api.login(email text, password text, org_name text) returns jsonb
     security definer
     language plpgsql
@@ -1167,6 +1210,43 @@ $$;
 
 grant execute on function api.create_client(text, text, text, text) to authenticated;
 
+create or replace function api.update_user_status(user_id bigint, status users.user_status) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _target_user_role users.user_role;
+    _current_user_role users.user_role;
+    _create_user_status_result record;
+begin
+    -- Verify user has permission to update the target user's status
+    _target_user_role := users.user_role(user_id);
+    _current_user_role := auth.current_user_role();
+    if (_target_user_role = 'org_client' and _current_user_role not in ('org_admin', 'org_owner')) or (_target_user_role = 'org_admin' and _current_user_role != 'org_owner') then
+        raise exception 'User Status Update Failed'
+            using
+                detail = 'You are not authorized to update the status of this user',
+                hint = 'unauthorized';
+    end if;
+
+    _create_user_status_result := users.create_user_status(user_id, status);
+    if _create_user_status_result.validation_failure_message is not null then
+        raise exception 'User Status Update Failed'
+            using
+                detail = 'Invalid Request Payload',
+                hint = _create_user_status_result.validation_failure_message;
+    end if;
+
+    return jsonb_build_object(
+        'user_id', (_create_user_status_result.created_status).user_id,
+        'status', (_create_user_status_result.created_status).status
+    );
+end;
+$$;
+
+grant execute on function api.update_user_status(bigint, users.user_status) to authenticated;
+
 -- Views
 -- Organization
 create or replace view api.organizations as
@@ -1176,7 +1256,7 @@ select
     o.org_name,
     case 
         when f.file_id is not null then 
-            api.generate_s3_presigned_url(
+            aws.generate_s3_presigned_url(
                 f.bucket,
                 f.object_key,
                 f.region,
@@ -1206,7 +1286,7 @@ select
     users.user_status(u.user_id) as status,
     case
         when f.file_id is not null then
-            api.generate_s3_presigned_url(
+            aws.generate_s3_presigned_url(
                 f.bucket,
                 f.object_key,
                 f.region,
