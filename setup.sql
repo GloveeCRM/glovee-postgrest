@@ -1367,7 +1367,9 @@ begin
                 hint = _update_user_result.validation_failure_message;
     end if;
 
-    return _update_user_result.updated_user;
+    return jsonb_build_object(
+        'user', _update_user_result.updated_user
+    );
 end;
 $$;
 
