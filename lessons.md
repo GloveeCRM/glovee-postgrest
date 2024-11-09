@@ -204,3 +204,36 @@ references
 ## Search and pagination
 
 - Using views you can do search and pagination. However what was not so clear was how to get the total count of the search results. For that, you can easily just set the count parameter as exact in the header.
+
+## by default, everyone can execute functions
+
+- let's fix that!:
+
+```sql
+alter default privileges revoke execute on functions from public;
+```
+
+By default, all users can execute all functions for schemas they have `usage` granted for
+
+## API Function parameters
+
+- api function params must be either the name of the variables in the post body or a json input with no name for variable foo(json) so then can be accessed by $1 or be foo(some_name json) and the request body is {some_name: {}}
+
+## Functions called in the view are treated the same as if they had been called directly from the query using the view.
+
+- Leanred this one when I was trying to call aws presigned url generator from the view and kept getting the following error:
+
+```json
+{
+  "code": "42501",
+  "details": null,
+  "hint": null,
+  "message": "permission denied for function generate_s3_presigned_url"
+}
+```
+
+references:
+
+- https://www.postgresql.org/docs/current/sql-createview.html
+
+- https://www.postgresql.org/docs/current/sql-createfunction.html

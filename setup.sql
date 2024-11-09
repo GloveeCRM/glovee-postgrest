@@ -39,6 +39,9 @@ $$;
 -- Grant permissions
 grant usage on schema api to anon;
 grant usage on schema api to authenticated;
+grant anon to authenticated;
+
+alter default privileges revoke execute on functions from public;
 
 -- Utilities
 create extension if not exists pgcrypto;
@@ -103,12 +106,26 @@ create table users.user
     hashed_password text,
     first_name text,
     last_name text,
-    role users.user_role not null,
-    status users.user_status not null,
     profile_picture_file_id bigint,
     created_at timestamp with time zone default now(),
     updated_at timestamp with time zone default now(),
     constraint unique_email_organization unique (email, organization_id)
+);
+
+create table users.account_status
+(
+    account_status_id bigint default utils.generate_random_id() not null primary key,
+    user_id bigint references users.user(user_id) on delete cascade,
+    status users.user_status not null,
+    created_at timestamp with time zone default now()
+);
+
+create table users.account_role
+(
+    account_role_id bigint default utils.generate_random_id() not null primary key,
+    user_id bigint references users.user(user_id) on delete cascade,
+    role users.user_role not null,
+    created_at timestamp with time zone default now()
 );
 
 create table organizations.organization_config
@@ -172,6 +189,13 @@ begin
 
     return _config_value;
 end;
+$$;
+
+create or replace function config.item_from_app_settings(_key text) returns text
+    language sql
+as
+$$
+    select current_setting('app.settings.' || _key);
 $$;
 
 -- Auth
@@ -276,9 +300,60 @@ $$;
 create or replace function auth.current_user_organization_id()
 returns bigint
 language sql
+security definer
 as
 $$
     select (nullif(current_setting('request.jwt.claims', true), '')::jsonb -> 'user' ->> 'organization_id')::bigint;
+$$;
+
+grant execute on function auth.current_user_organization_id() to authenticated;
+
+create or replace function auth.current_user_id()
+returns bigint
+language sql
+security definer
+as
+$$
+    select (nullif(current_setting('request.jwt.claims', true), '')::jsonb -> 'user' ->> 'user_id')::bigint;
+$$;
+
+create or replace function auth.current_user_role()
+returns users.user_role
+language sql
+as
+$$
+    select (nullif(current_setting('request.jwt.claims', true), '')::jsonb -> 'user' ->> 'role')::users.user_role;
+$$;
+
+grant execute on function auth.current_user_role() to authenticated;
+create or replace function auth.validate_current_user_org_access(
+    _org_name text
+) returns text
+    language plpgsql
+as
+$$
+declare
+    _target_organization_id bigint;
+begin
+    if _org_name is null or _org_name = '' then
+        return 'org_name_missing';
+    end if;
+
+    select organization_id
+    into _target_organization_id
+    from organizations.organization
+    where org_name = _org_name;
+
+    if _target_organization_id is null then
+        return 'organization_not_found';
+    end if;
+
+    if auth.current_user_organization_id() != _target_organization_id then
+        return 'organization_access_denied';
+    end if;
+
+    return null;
+end;
 $$;
 
 create function auth.validate_login_input(_email text, _password text, _org_name text) returns text
@@ -324,10 +399,12 @@ declare
     _is_password_valid boolean;
     _access_token_claims jsonb;
     _refresh_token_claims jsonb;
-    _access_token_secret text := config.get('access_token_secret');
-    _refresh_token_secret text := config.get('refresh_token_secret');
-    _access_token_expiration text := config.get('access_token_expiration');
-    _refresh_token_expiration text := config.get('refresh_token_expiration');
+    _user_role users.user_role;
+    _user_status users.user_status;
+    _access_token_secret text := config.item_from_app_settings('jwt_access_secret');
+    _refresh_token_secret text := config.item_from_app_settings('jwt_refresh_secret');
+    _access_token_expiration text := config.item_from_app_settings('jwt_access_expiration');
+    _refresh_token_expiration text := config.item_from_app_settings('jwt_refresh_expiration');
 begin
     -- Validate input
     validation_failure_message := auth.validate_login_input(_email, _password, _org_name);
@@ -342,8 +419,11 @@ begin
     join organizations.organization o on o.organization_id = u.organization_id
     where email = _email and o.org_name = _org_name;
 
+    _user_status := users.user_status(_user.user_id);
+    _user_role := users.user_role(_user.user_id);
+
     -- Check if user is active
-    if _user.status <> 'active' then
+    if _user_status <> 'active' then
         validation_failure_message := 'user_not_active';
         return;
     end if;
@@ -371,9 +451,9 @@ begin
         'user', jsonb_build_object(
             'user_id', _user.user_id,
             'email', _user.email,
-            'role', _user.role,
+            'role', _user_role,
             'organization_id', _user.organization_id,
-            'status', _user.status
+            'status', _user_status
         ),
         'organization', jsonb_build_object(
             'organization_id', _organization.organization_id,
@@ -401,11 +481,12 @@ create function auth.validate_refresh_tokens_input(_refresh_token text) returns 
 as
 $$
 declare
-    _refresh_token_secret text := config.get('refresh_token_secret');
+    _refresh_token_secret text := config.item_from_app_settings('jwt_refresh_secret');
     _refresh_token_claims jsonb;
     _refresh_token_valid boolean;
     _user_id bigint;
     _user users.user;
+    _user_status users.user_status;
 begin
     if _refresh_token is null or _refresh_token = '' then
         return 'refresh_token_missing';
@@ -431,11 +512,14 @@ begin
     from users.user
     where user_id = _user_id;
 
+
     if not found then
         return 'user_not_found';
     end if;
 
-    if _user.status <> 'active' then
+    _user_status := users.user_status(_user.user_id);
+
+    if _user_status <> 'active' then
         return 'user_not_active';
     end if;
 
@@ -453,10 +537,12 @@ declare
     _organization organizations.organization;
     _new_access_token_claims jsonb;
     _new_refresh_token_claims jsonb;
-    _access_token_secret text := config.get('access_token_secret');
-    _access_token_expiration text := config.get('access_token_expiration');
-    _refresh_token_secret text := config.get('refresh_token_secret');
-    _refresh_token_expiration text := config.get('refresh_token_expiration');
+    _user_role users.user_role;
+    _user_status users.user_status;
+    _access_token_secret text := config.item_from_app_settings('jwt_access_secret');
+    _access_token_expiration text := config.item_from_app_settings('jwt_access_expiration');
+    _refresh_token_secret text := config.item_from_app_settings('jwt_refresh_secret');
+    _refresh_token_expiration text := config.item_from_app_settings('jwt_refresh_expiration');
     _refresh_token_claims jsonb;
 begin
     -- validate refresh token
@@ -478,6 +564,9 @@ begin
     from users.user
     where user_id = _user_id;
 
+    _user_role := users.user_role(_user.user_id);
+    _user_status := users.user_status(_user.user_id);
+
     -- Fetch organization record
     select *
     into _organization
@@ -493,9 +582,9 @@ begin
         'user', jsonb_build_object(
             'user_id', _user.user_id,
             'email', _user.email,
-            'role', _user.role,
+            'role', _user_role,
             'organization_id', _user.organization_id,
-            'status', _user.status
+            'status', _user_status
         ),
         'organization', jsonb_build_object(
             'organization_id', _organization.organization_id,
@@ -518,7 +607,89 @@ begin
 end;
 $$;
 
+create or replace function auth.generate_random_password() returns text
+    language plpgsql
+as
+$$
+declare
+    _uppercase text := 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+    _lowercase text := 'abcdefghijklmnopqrstuvwxyz';
+    _numbers text := '0123456789';
+    _special_chars text := '!@#$%^&*(),.?":{}|<>';
+    _password text := '';
+    _i integer;
+begin
+    -- Add at least one character from each required category
+    _password := _password || substr(_uppercase, (random() * length(_uppercase))::integer + 1, 1);
+    _password := _password || substr(_lowercase, (random() * length(_lowercase))::integer + 1, 1);
+    _password := _password || substr(_numbers, (random() * length(_numbers))::integer + 1, 1);
+    _password := _password || substr(_special_chars, (random() * length(_special_chars))::integer + 1, 1);
+
+    -- Add 8 more random characters to make it 12 characters long
+    for _i in 1..8 loop
+        case (random() * 4)::integer + 1
+            when 1 then
+                _password := _password || substr(_uppercase, (random() * length(_uppercase))::integer + 1, 1);
+            when 2 then
+                _password := _password || substr(_lowercase, (random() * length(_lowercase))::integer + 1, 1);
+            when 3 then
+                _password := _password || substr(_numbers, (random() * length(_numbers))::integer + 1, 1);
+            when 4 then
+                _password := _password || substr(_special_chars, (random() * length(_special_chars))::integer + 1, 1);
+            else
+        end case;
+    end loop;
+
+    -- Shuffle the password characters
+    _password := array_to_string(
+        array(
+            select substr(_password, i, 1)
+            from generate_series(1, length(_password)) i
+            order by random()
+        ),
+        ''
+    );
+
+    return _password;
+end;
+$$;
+
 -- Users
+create or replace function users.user_organization_id(_user_id bigint) returns bigint
+    language sql
+as
+$$
+    select u.organization_id from users.user u where u.user_id = _user_id;
+$$;
+
+create or replace function users.user_role(_user_id bigint) returns users.user_role
+    language sql
+    security definer
+as
+$$
+    select role
+    from users.account_role
+    where user_id = _user_id
+    order by created_at desc
+    limit 1;
+$$;
+
+grant execute on function users.user_role(bigint) to anon, authenticated;
+
+create or replace function users.user_status(_user_id bigint) returns users.user_status
+    language sql
+    security definer
+as
+$$
+    select status
+    from users.account_status
+    where user_id = _user_id
+    order by created_at desc
+    limit 1;
+$$;
+
+grant execute on function users.user_status(bigint) to anon, authenticated;
+
 create function users.validate_create_user_input(_first_name text, _last_name text, _email text, _password text, _org_name text, _role users.user_role DEFAULT 'org_client') returns text
     language plpgsql
 as
@@ -622,18 +793,32 @@ begin
         email,
         hashed_password,
         first_name,
-        last_name,
-        role,
-        status
+        last_name
     ) values (
         _organization_id,
         lower(_email),
         _hashed_password,
         _first_name,
-        _last_name,
-        _role,
-        'active'
+        _last_name
     ) returning * into _new_user;
+
+    -- Insert account role
+    insert into users.account_role (
+        user_id,
+        role
+    ) values (
+        _new_user.user_id,
+        _role
+    );
+
+    -- Insert account status
+    insert into users.account_status (
+        user_id,
+        status
+    ) values (
+        _new_user.user_id,
+        'active'
+    );
 
     -- Return user data
     created_user := jsonb_build_object(
@@ -642,8 +827,8 @@ begin
         'first_name', _new_user.first_name,
         'last_name', _new_user.last_name,
         'email', _new_user.email,
-        'role', _new_user.role,
-        'status', _new_user.status,
+        'role', users.user_role(_new_user.user_id),
+        'status', users.user_status(_new_user.user_id),
         'created_at', _new_user.created_at,
         'updated_at', _new_user.updated_at
     );
@@ -845,6 +1030,26 @@ end;
 $$;
 
 -- Api
+create or replace function api.generate_s3_presigned_url(
+    _bucket_name text,
+    _object_key text,
+    _region text,
+    _operation text default 'get',
+    _expires_in_seconds int default 3600
+) returns text
+    language plpgsql
+    security definer
+as $$
+declare
+    _url text;
+begin
+    _url := aws.generate_s3_presigned_url(_bucket_name, _object_key, _region, _operation, _expires_in_seconds);
+    return _url;
+end;
+$$;
+
+grant execute on function api.generate_s3_presigned_url(text, text, text, text, int) to anon, authenticated;
+
 create function api.login(email text, password text, org_name text) returns jsonb
     security definer
     language plpgsql
@@ -919,6 +1124,49 @@ $$;
 
 grant execute on function api.register_client(text, text, text, text, text) to anon;
 
+create or replace function api.create_client(first_name text, last_name text, email text, org_name text) returns jsonb
+    security definer
+    language plpgsql
+as
+$$
+declare
+    _org_access_validation_failure_message text;
+    _password text;
+    _create_user_result record;
+begin
+    _org_access_validation_failure_message := auth.validate_current_user_org_access(org_name);
+    if _org_access_validation_failure_message is not null then
+        raise exception 'Organization Access Denied'
+            using
+                detail = 'The organization you are requesting to create a client for does not match the organization you are authenticated as',
+                hint = _org_access_validation_failure_message;
+    end if;
+
+    _password := auth.generate_random_password();
+    _create_user_result := users.create_user(
+        first_name,
+        last_name,
+        email,
+        _password,
+        org_name,
+        'org_client'
+    );
+
+    if _create_user_result.validation_failure_message is not null then
+        raise exception 'Client Creation Failed'
+            using
+                detail = 'Invalid Request Payload',
+                hint = _create_user_result.validation_failure_message;
+    end if;
+
+    return jsonb_build_object(
+        'user', _create_user_result.created_user
+    );
+end;
+$$;
+
+grant execute on function api.create_client(text, text, text, text) to authenticated;
+
 -- Views
 -- Organization
 create or replace view api.organizations as
@@ -928,7 +1176,7 @@ select
     o.org_name,
     case 
         when f.file_id is not null then 
-            aws.generate_s3_presigned_url(
+            api.generate_s3_presigned_url(
                 f.bucket,
                 f.object_key,
                 f.region,
@@ -954,11 +1202,11 @@ select
     u.first_name,
     u.last_name,
     concat(u.first_name, ' ', u.last_name) as full_name,
-    u.role,
-    u.status,
+    users.user_role(u.user_id) as role,
+    users.user_status(u.user_id) as status,
     case
         when f.file_id is not null then
-            aws.generate_s3_presigned_url(
+            api.generate_s3_presigned_url(
                 f.bucket,
                 f.object_key,
                 f.region,
@@ -970,7 +1218,7 @@ select
     u.updated_at
 from users.user u
 left join files.file f on u.profile_picture_file_id = f.file_id
-where u.role = 'org_client' and u.organization_id = auth.current_user_organization_id();
+where users.user_role(u.user_id) = 'org_client' and u.organization_id = auth.current_user_organization_id();
 
 grant select on api.clients to authenticated;
 
@@ -981,11 +1229,7 @@ begin;
 
 -- Ask Ben for these values
 insert into config.config (key, value) values
-    ('access_token_secret', ''),
-    ('refresh_token_secret', ''),
-    ('access_token_expiration', '3600'),  -- 1 hour in seconds
-    ('refresh_token_expiration', '86400'),  -- 1 day in seconds
-    ('aws_iam_s3_presigned_url_lambda_account_number', '');
+    ('aws_iam_s3_presigned_url_lambda_account_number', '730335337751');
 
 
 insert into organizations.organization (organization_id, name, org_name) values
@@ -1009,11 +1253,17 @@ insert into users.user (
     email,
     hashed_password,
     first_name,
-    last_name,
-    role,
-    status
+    last_name
 ) values
-    (1111111, 12345678, 'admin@glovee.com', crypt('Test@123', gen_salt('bf')), 'Admin', 'User', 'org_admin', 'active'),
-    (2222222, 12345678, 'client@glovee.com', crypt('Test@123', gen_salt('bf')), 'Client', 'User', 'org_client', 'active');
+    (1111111, 12345678, 'admin@glovee.com', crypt('Test@123', gen_salt('bf')), 'Admin', 'User'),
+    (2222222, 12345678, 'client@glovee.com', crypt('Test@123', gen_salt('bf')), 'Client', 'User');
+
+insert into users.account_role (user_id, role) values
+    (1111111, 'org_admin'),
+    (2222222, 'org_client');
+
+insert into users.account_status (user_id, status) values
+    (1111111, 'active'),
+    (2222222, 'active');
 
 commit;
