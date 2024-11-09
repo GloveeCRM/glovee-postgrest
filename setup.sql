@@ -896,6 +896,96 @@ begin
 end;
 $$;
 
+create or replace function users.validate_update_user_input(_user_id bigint, _email text default null, _first_name text default null, _last_name text default null, _profile_picture_file_id bigint default null) returns text
+    language plpgsql
+    security definer
+as
+$$
+begin
+    if _user_id is null then
+        return 'user_id_missing';
+    end if;
+
+    if _email is not null and not _email ilike '%@%' then
+        return 'invalid_email_format';
+    end if;
+
+    if _first_name is not null and _first_name = '' then
+        return 'first_name_missing';
+    end if;
+
+    if _last_name is not null and _last_name = '' then
+        return 'last_name_missing';
+    end if;
+
+    if _email is not null and exists (
+        select 1
+        from users.user
+        where email = lower(_email) and organization_id = auth.current_user_organization_id()
+        and user_id != _user_id
+    ) then
+        return 'email_already_in_use';
+    end if;
+
+    if _profile_picture_file_id is not null and not exists (
+        select 1
+        from files.file
+        where file_id = _profile_picture_file_id
+    ) then
+        return 'profile_picture_not_found';
+    end if;
+
+    if not exists (
+        select 1
+        from users.user
+        where user_id = _user_id and organization_id = auth.current_user_organization_id()
+    ) then
+        return 'user_not_found';
+    end if;
+
+    return null;
+end;
+$$;
+
+create or replace function users.update_user(
+    _user_id bigint,
+    _email text default null,
+    _first_name text default null,
+    _last_name text default null,
+    _profile_picture_file_id bigint default null,
+    out validation_failure_message text,
+    out updated_user jsonb
+) returns record
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _updated_user users.user;
+begin
+    validation_failure_message := users.validate_update_user_input(_user_id, _email, _first_name, _last_name, _profile_picture_file_id);
+    if validation_failure_message is not null then
+        return;
+    end if;
+
+    update users.user u
+    set email = coalesce(_email, u.email),
+        first_name = coalesce(_first_name, u.first_name),
+        last_name = coalesce(_last_name, u.last_name),
+        profile_picture_file_id = coalesce(_profile_picture_file_id, u.profile_picture_file_id),
+        updated_at = now()
+    where user_id = _user_id and organization_id = auth.current_user_organization_id()
+    returning to_jsonb(row_to_json(u)) - 'hashed_password' into updated_user;
+
+    updated_user := updated_user || jsonb_build_object(
+        'role', users.user_role(_user_id),
+        'status', users.user_status(_user_id)
+    );
+
+    return;
+end;
+$$;
+
 -- AWS
 create or replace function aws.generate_s3_presigned_url(
     _bucket_name text,
@@ -1246,6 +1336,42 @@ end;
 $$;
 
 grant execute on function api.update_user_status(bigint, users.user_status) to authenticated;
+
+create or replace function api.update_user(user_id bigint, email text default null, first_name text default null, last_name text default null, profile_picture_file_id bigint default null) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_user_id bigint := auth.current_user_id();
+    _target_user_role users.user_role := users.user_role(user_id);
+    _current_user_role users.user_role := auth.current_user_role();
+    _update_user_result record;
+begin
+    -- Verify user has permission to update the target user
+    if (_current_user_role = 'org_client' and user_id != _current_user_id) 
+    or (_current_user_role = 'org_admin' and _target_user_role = 'org_admin' and user_id != _current_user_id)
+    or (_target_user_role = 'org_owner' and _current_user_role != 'org_owner') 
+    then
+        raise exception 'User Update Failed'
+            using
+                detail = 'You are not authorized to update this user',
+                hint = 'unauthorized';
+    end if;
+
+    _update_user_result := users.update_user(user_id, email, first_name, last_name, profile_picture_file_id);
+    if _update_user_result.validation_failure_message is not null then
+        raise exception 'User Update Failed'
+            using
+                detail = 'Invalid Request Payload',
+                hint = _update_user_result.validation_failure_message;
+    end if;
+
+    return _update_user_result.updated_user;
+end;
+$$;
+
+grant execute on function api.update_user(bigint, text, text, text, bigint) to authenticated;
 
 -- Views
 -- Organization
