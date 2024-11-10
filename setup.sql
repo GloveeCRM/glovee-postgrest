@@ -201,6 +201,26 @@ $$
     select current_setting('app.settings.' || _key);
 $$;
 
+-- Organization
+create or replace function organizations.org_id_by_org_name(_org_name text) returns bigint
+    language sql
+as
+$$
+    select organization_id from organizations.organization where org_name = _org_name;
+$$;
+
+create or replace function organizations.config_by_org_id(_organization_id bigint) returns organizations.organization_config
+    language plpgsql
+as
+$$
+declare
+    _config organizations.organization_config;
+begin
+    select * into _config from organizations.organization_config where organization_id = _organization_id;
+    return _config;
+end;
+$$;
+
 -- Auth
 create function auth.url_encode(data bytea) returns text
     immutable
@@ -392,7 +412,7 @@ begin
 end;
 $$;
 
-create or replace function auth.login(_email text, _password text, _org_name text, OUT validation_failure_message text, OUT access_token text, OUT refresh_token text) returns record
+create or replace function auth.login(_email text, _password text, _org_name text, out validation_failure_message text, out access_token text, OUT refresh_token text) returns record
     language plpgsql
 as
 $$
@@ -530,7 +550,7 @@ begin
 end;
 $$;
 
-create function auth.refresh_tokens(_refresh_token text, OUT validation_failure_message text, OUT access_token text, OUT refresh_token text) returns record
+create function auth.refresh_tokens(_refresh_token text, out validation_failure_message text, out access_token text, out refresh_token text) returns record
     language plpgsql
 as
 $$
@@ -766,7 +786,16 @@ begin
 end;
 $$;
 
-create or replace function users.create_user(_first_name text, _last_name text, _email text, _password text, _org_name text, _role users.user_role DEFAULT 'org_client', OUT validation_failure_message text, OUT created_user jsonb) returns record
+create or replace function users.create_user(
+    _first_name text,
+    _last_name text,
+    _email text,
+    _password text,
+    _org_name text,
+    _role users.user_role default 'org_client',
+    out validation_failure_message text,
+    out created_user jsonb
+) returns record
     language plpgsql
 as
 $$
@@ -874,8 +903,6 @@ create or replace function users.create_user_status(
     security definer
 as
 $$
-declare
-    _inserted_status users.account_status;
 begin
     validation_failure_message := users.validate_create_user_status_input(_user_id, _status);
     if validation_failure_message is not null then
@@ -888,15 +915,13 @@ begin
     ) values (
         _user_id,
         _status
-    ) returning * into _inserted_status;
-
-    created_status := _inserted_status;
+    ) returning * into created_status;
 
     return;
 end;
 $$;
 
-create or replace function users.validate_update_user_input(_user_id bigint, _email text default null, _first_name text default null, _last_name text default null, _profile_picture_file_id bigint default null) returns text
+create or replace function users.validate_update_user_input(_user_id bigint, _email text default null, _first_name text default null, _last_name text default null) returns text
     language plpgsql
     security definer
 as
@@ -927,14 +952,6 @@ begin
         return 'email_already_in_use';
     end if;
 
-    if _profile_picture_file_id is not null and not exists (
-        select 1
-        from files.file
-        where file_id = _profile_picture_file_id
-    ) then
-        return 'profile_picture_not_found';
-    end if;
-
     if not exists (
         select 1
         from users.user
@@ -952,7 +969,6 @@ create or replace function users.update_user(
     _email text default null,
     _first_name text default null,
     _last_name text default null,
-    _profile_picture_file_id bigint default null,
     out validation_failure_message text,
     out updated_user jsonb
 ) returns record
@@ -963,7 +979,7 @@ $$
 declare
     _updated_user users.user;
 begin
-    validation_failure_message := users.validate_update_user_input(_user_id, _email, _first_name, _last_name, _profile_picture_file_id);
+    validation_failure_message := users.validate_update_user_input(_user_id, _email, _first_name, _last_name);
     if validation_failure_message is not null then
         return;
     end if;
@@ -972,7 +988,6 @@ begin
     set email = coalesce(_email, u.email),
         first_name = coalesce(_first_name, u.first_name),
         last_name = coalesce(_last_name, u.last_name),
-        profile_picture_file_id = coalesce(_profile_picture_file_id, u.profile_picture_file_id),
         updated_at = now()
     where user_id = _user_id and organization_id = auth.current_user_organization_id()
     returning to_jsonb(row_to_json(u)) - 'hashed_password' into updated_user;
@@ -983,6 +998,58 @@ begin
     );
 
     return;
+end;
+$$;
+
+create or replace function users.validate_create_user_profile_picture_input(
+    _user_id bigint,
+    _file_id bigint
+) returns text
+    language plpgsql
+as
+$$
+begin
+    if _user_id is null or _user_id <= 0 then
+        return 'missing_user_id';
+    end if;
+
+    if _file_id is null or _file_id <= 0 then
+        return 'missing_file_id';
+    end if;
+
+    if not exists (
+        select 1 
+        from files.file
+        where file_id = _file_id
+    ) then
+        return 'file_not_found';
+    end if;
+
+    return null;
+end;
+$$;
+
+create or replace function users.create_user_profile_picture(
+    _user_id bigint, 
+    _file_id bigint, 
+    out validation_failure_message text,
+    out created_user_profile_picture users.user
+) returns record
+    language plpgsql
+    security definer
+as
+$$
+begin
+    validation_failure_message := users.validate_create_user_profile_picture_input(_user_id, _file_id);
+    if validation_failure_message is not null then
+        return;
+    end if;
+
+    update users.user 
+    set profile_picture_file_id = _file_id,
+        updated_at = now()
+    where user_id = _user_id
+    returning * into created_user_profile_picture;
 end;
 $$;
 
@@ -1182,6 +1249,130 @@ begin
 end;
 $$;
 
+create or replace function files.validate_create_file_input(
+    _object_key text,
+    _file_name text,
+    _bucket text,
+    _region text,
+    _mime_type text,
+    _size bigint,
+    _organization_id bigint,
+    _created_by bigint
+) returns text
+language plpgsql
+as
+$$
+declare
+    _target_org_config organizations.organization_config := organizations.config_by_org_id(_organization_id);
+begin
+    if _object_key is null or _object_key = '' then
+        return 'missing_object_key';
+    end if;
+
+    if _file_name is null or _file_name = '' then
+        return 'missing_file_name';
+    end if;
+
+    if _bucket is null or _bucket = '' then
+        return 'missing_bucket';
+    end if;
+
+    if _bucket != _target_org_config.s3_bucket then
+        return 'invalid_bucket';
+    end if;
+
+    if _region is null or _region = '' then
+        return 'missing_region';
+    end if;
+
+    if _region != _target_org_config.s3_region then
+        return 'invalid_region';
+    end if;
+
+    if _mime_type is null or _mime_type = '' then
+        return 'missing_mime_type';
+    end if;
+
+    if _size is null or _size <= 0 then
+        return 'missing_size';
+    end if;
+
+    if _organization_id is null or _organization_id <= 0 then
+        return 'missing_organization_id';
+    end if;
+
+    if _created_by is null or _created_by <= 0 then
+        return 'missing_created_by';
+    end if;
+
+    return null;
+end;
+$$;
+
+create or replace function files.create_file(
+    _object_key text,
+    _file_name text,
+    _bucket text,
+    _region text,
+    _mime_type text,
+    _size bigint,
+    _organization_id bigint,
+    _created_by bigint,
+    _metadata jsonb default null,
+    _version bigint default 1,
+    _is_public boolean default false,
+    out validation_failure_message text,
+    out created_file files.file
+) returns record
+    language plpgsql
+    security definer
+as
+$$
+begin
+    validation_failure_message := files.validate_create_file_input(
+        _object_key,
+        _file_name,
+        _bucket,
+        _region,
+        _mime_type,
+        _size,
+        _organization_id,
+        _created_by
+    );
+    if validation_failure_message is not null then
+        return;
+    end if;
+
+    insert into files.file (
+        object_key,
+        name,
+        bucket,
+        region,
+        mime_type,
+        size,
+        organization_id,
+        created_by,
+        version,
+        is_public,
+        metadata
+    ) values (
+        _object_key,
+        _file_name,
+        _bucket,
+        _region,
+        _mime_type,
+        _size,
+        _organization_id,
+        _created_by,
+        _version,
+        _is_public,
+        _metadata
+    ) returning * into created_file;
+
+    return;
+end;
+$$;
+
 -- Api
 create function api.login(email text, password text, org_name text) returns jsonb
     security definer
@@ -1337,7 +1528,7 @@ $$;
 
 grant execute on function api.update_user_status(bigint, users.user_status) to authenticated;
 
-create or replace function api.update_user(user_id bigint, email text default null, first_name text default null, last_name text default null, profile_picture_file_id bigint default null) returns jsonb
+create or replace function api.update_user(user_id bigint, email text default null, first_name text default null, last_name text default null) returns jsonb
     language plpgsql
     security definer
 as
@@ -1359,7 +1550,7 @@ begin
                 hint = 'unauthorized';
     end if;
 
-    _update_user_result := users.update_user(user_id, email, first_name, last_name, profile_picture_file_id);
+    _update_user_result := users.update_user(user_id, email, first_name, last_name);
     if _update_user_result.validation_failure_message is not null then
         raise exception 'User Update Failed'
             using
@@ -1373,7 +1564,115 @@ begin
 end;
 $$;
 
-grant execute on function api.update_user(bigint, text, text, text, bigint) to authenticated;
+grant execute on function api.update_user(bigint, text, text, text) to authenticated;
+
+create or replace function api.profile_picture_upload_url(org_name text, user_id bigint, file_name text default null, mime_type text default null) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_user_id bigint := auth.current_user_id();
+    _current_user_role users.user_role := auth.current_user_role();
+    _target_user_role users.user_role := users.user_role(user_id);
+    _target_org_id bigint := organizations.org_id_by_org_name(org_name);
+    _object_key text;
+    _org_config organizations.organization_config;
+begin
+    if (_current_user_role = 'org_client' and user_id != _current_user_id)
+    or (_current_user_role = 'org_admin' and _target_user_role != 'org_client' and user_id != _current_user_id) 
+    or (_target_user_role = 'org_owner' and _current_user_role != 'org_owner') then
+        raise exception 'Profile Picture Upload URL Failed'
+            using
+                detail = 'You are not authorized to update this user',
+                hint = 'unauthorized';
+    end if;
+
+    _object_key := files.generate_object_key(
+        _target_org_id,
+        'profile_picture',
+        mime_type,
+        file_name,
+        user_id
+    );
+
+    _org_config := organizations.config_by_org_id(_target_org_id);
+
+    return jsonb_build_object(
+        'url', aws.generate_s3_presigned_url(
+            _org_config.s3_bucket,
+            _object_key,
+            _org_config.s3_region,
+            'PUT',
+            3600
+        ),
+        'object_key', _object_key
+    );
+end;
+$$;
+
+grant execute on function api.profile_picture_upload_url(text,  bigint, text, text) to authenticated;
+
+create or replace function api.create_user_profile_picture(
+    user_id bigint, 
+    object_key text, 
+    file_name text, 
+    mime_type text, 
+    size bigint, 
+    metadata jsonb default null
+) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _user_org_config organizations.organization_config;
+    _create_file_result record;
+    _updated_user_result record;
+begin
+    _user_org_config := organizations.config_by_org_id(auth.current_user_organization_id());
+    
+    _create_file_result := files.create_file(
+        object_key,
+        file_name,
+        _user_org_config.s3_bucket,
+        _user_org_config.s3_region,
+        mime_type,
+        size,
+        auth.current_user_organization_id(),
+        auth.current_user_id(),
+        metadata
+    );
+
+    if _create_file_result.validation_failure_message is not null then
+        raise exception 'User Profile Picture Creation Failed'
+            using
+                detail = 'Invalid Request Payload',
+                hint = _create_file_result.validation_failure_message;
+    end if;
+
+    -- Update the user's profile picture file id
+    _updated_user_result := users.create_user_profile_picture(user_id, (_create_file_result.created_file).file_id);
+    if _updated_user_result.validation_failure_message is not null then
+        raise exception 'User Profile Picture Update Failed'
+            using
+                detail = 'Invalid Request Payload',
+                hint = _updated_user_result.validation_failure_message;
+    end if;
+
+    return jsonb_build_object(
+        'url', aws.generate_s3_presigned_url(
+            _user_org_config.s3_bucket,
+            object_key,
+            _user_org_config.s3_region,
+            'GET',
+            3600
+        )
+    );
+end;
+$$;
+
+grant execute on function api.create_user_profile_picture(bigint, text, text, text, bigint, jsonb) to authenticated;
 
 -- Views
 -- Organization

@@ -32,11 +32,15 @@ drop view if exists api.clients;
 drop function if exists aws.generate_s3_presigned_url(text, text, text, text, int);
 
 -- Drop file functions
+drop function if exists files.create_file(text, text, text, text, text, bigint, bigint, bigint, boolean, jsonb);
+drop function if exists files.validate_create_file_input(text, text, text, text, text, bigint, bigint, bigint, boolean, jsonb);
 drop function if exists files.get_file_extension_from_mimetype(text);
 drop function if exists files.generate_object_key(bigint, text, text, text, bigint);
 
 -- Drop API functionss
-drop function if exists api.update_user(bigint, text, text, text, bigint);
+drop function if exists api.create_user_profile_picture(bigint, text, text, text, bigint, jsonb);
+drop function if exists api.profile_picture_upload_url(text, bigint, text, text);
+drop function if exists api.update_user(bigint, text, text, text);
 drop function if exists api.update_user_status(bigint, users.user_status);
 drop function if exists api.create_client(text, text, text, text);
 drop function if exists api.register_client(text, text, text, text, text);
@@ -44,8 +48,10 @@ drop function if exists api.refresh_tokens(text);
 drop function if exists api.login(text, text, text);
 
 -- Drop user functions
-drop function if exists users.update_user(bigint, text, text, text, bigint);
-drop function if exists users.validate_update_user_input(bigint, text, text, text, bigint);
+drop function if exists users.create_user_profile_picture(bigint, bigint);
+drop function if exists users.validate_create_user_profile_picture_input(bigint, bigint);
+drop function if exists users.update_user(bigint, text, text, text);
+drop function if exists users.validate_update_user_input(bigint, text, text, text);
 drop function if exists users.create_user_status(bigint, users.user_status);
 drop function if exists users.validate_create_user_status_input(bigint, users.user_status);
 drop function if exists users.create_user(text, text, text, text, text, users.user_role);
@@ -72,6 +78,10 @@ drop function if exists auth.url_encode(bytea);
 -- Drop config functions
 drop function if exists config.get(text);
 drop function if exists config.item_from_app_settings(text);
+
+-- Drop organizations functions
+drop function if exists organizations.config_by_org_id(bigint);
+drop function if exists organizations.org_id_by_org_name(text);
 
 -- Drop tables and constraints
 alter table if exists organizations.organization drop constraint if exists logo_file_id_fk;
