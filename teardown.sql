@@ -104,7 +104,8 @@ drop domain if exists users.user_status cascade;
 
 -- Drop extensions
 drop extension if exists pgcrypto cascade;
-drop extension if exists aws_lambda cascade;  -- if using aws_lambda extension
+drop extension if exists aws_commons cascade;
+drop extension if exists aws_lambda cascade;
 
 -- Drop schemas
 drop schema if exists files cascade;
