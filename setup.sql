@@ -340,6 +340,8 @@ $$
     select (nullif(current_setting('request.jwt.claims', true), '')::jsonb -> 'user' ->> 'user_id')::bigint;
 $$;
 
+grant execute on function auth.current_user_id() to authenticated;
+
 create or replace function auth.current_user_role()
 returns users.user_role
 language sql
@@ -1725,9 +1727,134 @@ select
     u.updated_at
 from users.user u
 left join files.file f on u.profile_picture_file_id = f.file_id
-where users.user_role(u.user_id) = 'org_client' and u.organization_id = auth.current_user_organization_id();
+where
+    users.user_role(u.user_id) = 'org_client' 
+and 
+    u.organization_id = auth.current_user_organization_id()
+and (
+    (
+        auth.current_user_role() = 'org_client' 
+        and u.user_id = auth.current_user_id()
+    )
+    or auth.current_user_role() in ('org_admin', 'org_owner')
+);
 
 grant select on api.clients to authenticated;
+
+-- Applications
+create schema if not exists applications;
+
+-- Create application table
+create table applications.application (
+    application_id bigint default utils.generate_random_id() not null primary key,
+    user_id bigint not null references users.user(user_id) on delete set null,
+    created_at timestamp with time zone not null default now(),
+    updated_at timestamp with time zone not null default now()
+);
+
+create or replace function applications.validate_create_application_input(
+    _user_id bigint
+) returns text
+    language plpgsql
+as
+$$
+begin
+    if _user_id is null or _user_id <= 0 then
+        return 'missing_user_id';
+    end if;
+
+    return null;
+end;
+$$;
+
+create or replace function applications.create_application(
+    _user_id bigint,
+    out validation_failure_message text,
+    out created_application applications.application
+)
+    language plpgsql
+    security definer
+as
+$$
+begin
+    validation_failure_message := applications.validate_create_application_input(_user_id);
+    if validation_failure_message is not null then
+        return;
+    end if;
+
+    insert into applications.application (user_id)
+    values (_user_id)
+    returning * into created_application;
+
+    return;
+end;
+$$;
+
+create or replace function api.create_application(user_id bigint) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_user_org_id bigint;
+    _target_user_org_id bigint;
+    _create_application_result record;
+begin
+    _current_user_org_id := auth.current_user_organization_id();
+    _target_user_org_id := users.user_organization_id(user_id);
+    if _target_user_org_id is null or _target_user_org_id != _current_user_org_id then
+        raise exception 'Application Creation Failed'
+            using
+                detail = 'The user with the provided user_id does not exist in the organization of the authenticated user',
+                hint = 'user_not_found';
+    end if;
+
+    _create_application_result := applications.create_application(user_id);
+    if _create_application_result.validation_failure_message is not null then
+        raise exception 'Application Creation Failed'
+            using
+                detail = 'Invalid Request Payload',
+                hint = _create_application_result.validation_failure_message;
+    end if;
+
+    return jsonb_build_object(
+        'application', _create_application_result.created_application
+    );
+end;
+$$;
+
+grant execute on function api.create_application(bigint) to authenticated;
+
+-- Views
+create or replace view api.applications as
+select
+    a.application_id,
+    a.user_id,
+    jsonb_build_object(
+        'user_id', u.user_id,
+        'email', u.email,
+        'first_name', u.first_name,
+        'last_name', u.last_name,
+        'full_name', concat(u.first_name, ' ', u.last_name)
+    ) as owner,
+    a.created_at,
+    a.updated_at
+from applications.application a
+join
+    users.user u
+on
+    a.user_id = u.user_id
+where
+    u.organization_id = auth.current_user_organization_id()
+and (
+    (
+        auth.current_user_role() = 'org_client' 
+        and a.user_id = auth.current_user_id()
+    )
+    or auth.current_user_role() in ('org_admin', 'org_owner')
+);
+
+grant select on api.applications to authenticated;
 
 commit;
 
