@@ -24,11 +24,18 @@ exception when undefined_function or undefined_object then null;
 end$$;
 
 begin;
+-- Drop Application Files
+drop function if exists api.create_application_file(bigint, text, text, text, bigint, jsonb);
+drop function if exists applications.create_application_file(bigint, bigint, bigint);
+drop function if exists applications.validate_create_application_file_input(bigint, bigint, bigint);
+drop table if exists applications.application_file;
+
 -- Drop Applications
 drop view if exists api.applications;
 drop function if exists api.create_application(bigint);
 drop function if exists applications.create_application(bigint);
 drop function if exists applications.validate_create_application_input(bigint);
+drop function if exists applications.application_user_id(bigint);
 drop table if exists applications.application;
 drop schema if exists applications cascade;
 

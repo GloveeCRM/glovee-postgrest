@@ -1752,6 +1752,25 @@ create table applications.application (
     updated_at timestamp with time zone not null default now()
 );
 
+create or replace function applications.application_user_id(_application_id bigint) returns bigint
+    language sql
+as
+$$
+    select a.user_id 
+    from applications.application a 
+    where a.application_id = _application_id;
+$$;
+
+create or replace function applications.application_organization_id(_application_id bigint) returns bigint
+    language sql
+as
+$$
+    select u.organization_id
+    from applications.application a
+    join users.user u on a.user_id = u.user_id
+    where a.application_id = _application_id;
+$$;
+
 create or replace function applications.validate_create_application_input(
     _user_id bigint
 ) returns text
@@ -1785,6 +1804,96 @@ begin
     insert into applications.application (user_id)
     values (_user_id)
     returning * into created_application;
+
+    return;
+end;
+$$;
+
+-- Application Files
+create table applications.application_file (
+    application_file_id bigint default utils.generate_random_id() not null primary key,
+    application_id bigint not null references applications.application(application_id) on delete cascade,
+    file_id bigint not null references files.file(file_id) on delete cascade,
+    created_at timestamp with time zone not null default now(),
+    updated_at timestamp with time zone not null default now(),
+    created_by bigint not null references users.user(user_id) on delete set null
+);
+
+create or replace function applications.validate_create_application_file_input(
+    _application_id bigint,
+    _file_id bigint,
+    _created_by bigint
+) returns text
+    language plpgsql
+as
+$$
+begin
+    if _application_id is null or _application_id <= 0 then
+        return 'missing_application_id';
+    end if;
+
+    if _file_id is null or _file_id <= 0 then
+        return 'missing_file_id';
+    end if;
+
+    if _created_by is null or _created_by <= 0 then
+        return 'missing_created_by';
+    end if;
+
+    if not exists (
+        select 1 
+        from users.user u
+        where u.user_id = _created_by
+        and u.organization_id = auth.current_user_organization_id()
+    ) then
+        return 'user_not_found';
+    end if;
+
+    if not exists (
+        select 1
+        from files.file f
+        where f.file_id = _file_id
+        and f.organization_id = auth.current_user_organization_id()
+    ) then
+        return 'file_not_found';
+    end if;
+
+    if not exists (
+        select 1
+        from applications.application a
+        join users.user u on a.user_id = u.user_id
+        where a.application_id = _application_id
+        and u.organization_id = auth.current_user_organization_id()
+    ) then
+        return 'application_not_found';
+    end if;
+
+    return null;
+end;
+$$;
+
+create or replace function applications.create_application_file(
+    _application_id bigint,
+    _file_id bigint,
+    _created_by bigint,
+    out validation_failure_message text,
+    out created_application_file applications.application_file
+)
+    language plpgsql
+    security definer
+as
+$$
+begin
+    validation_failure_message := applications.validate_create_application_file_input(_application_id, _file_id, _created_by);
+    if validation_failure_message is not null then
+        return;
+    end if;
+
+    insert into applications.application_file 
+    (application_id, file_id, created_by)
+    values (_application_id, _file_id, _created_by)
+    returning * 
+    into created_application_file;
 
     return;
 end;
@@ -1824,6 +1933,254 @@ end;
 $$;
 
 grant execute on function api.create_application(bigint) to authenticated;
+
+-- Application Files
+create or replace function applications.application_organization_id(_application_id bigint) returns bigint
+    language sql
+as
+$$
+    select u.organization_id
+    from applications.application a
+    join users.user u on a.user_id = u.user_id
+    where a.application_id = _application_id;
+$$;
+
+create or replace function api.application_file_upload_url(
+    application_id bigint,
+    file_name text,
+    mime_type text
+) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_org_id bigint := auth.current_user_organization_id();
+    _current_user_id bigint := auth.current_user_id();
+    _current_user_role users.user_role := auth.current_user_role();
+    _target_user_id bigint := applications.application_user_id(application_id);
+    _target_org_id bigint := applications.application_organization_id(application_id);
+    _org_config organizations.organization_config;
+    _object_key text;
+begin
+    -- Check if the application's owner is the current user or the current user is an admin or owner in the organization of the application
+    if (_current_user_role = 'org_client' and _target_user_id != _current_user_id)
+    or (_current_user_role in ('org_admin', 'org_owner') and _target_org_id != _current_org_id) then
+        raise exception 'Application File Creation Failed'
+            using
+                detail = 'You are not authorized to create an application file for this application',
+                hint = 'unauthorized';
+    end if;
+
+    _object_key := files.generate_object_key(
+        _current_org_id,
+        'application_file',
+        mime_type,
+        file_name,
+        application_id
+    );
+
+    _org_config := organizations.config_by_org_id(_current_org_id);
+
+    return jsonb_build_object(
+        'url', aws.generate_s3_presigned_url(
+            _org_config.s3_bucket,
+            _object_key,
+            _org_config.s3_region,
+            'PUT',
+            3600
+        ),
+        'object_key', _object_key
+    );
+end;
+$$;
+
+grant execute on function api.application_file_upload_url(bigint, text, text) to authenticated;
+
+create or replace function api.create_application_file(
+    application_id bigint,
+    object_key text,
+    file_name text,
+    mime_type text,
+    size bigint,
+    metadata jsonb default null
+) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_user_id bigint := auth.current_user_id();
+    _current_user_org_id bigint := auth.current_user_organization_id();
+    _target_user_id bigint := applications.application_user_id(application_id);
+    _current_user_role users.user_role := auth.current_user_role();
+    _user_org_config organizations.organization_config;
+    _create_file_result record;
+    _create_application_file_result record;
+begin
+    if _current_user_role = 'org_client' and _target_user_id != _current_user_id then
+        raise exception 'Application File Creation Failed'
+            using
+                detail = 'You are not authorized to create an application file for this application',
+                hint = 'unauthorized';
+    end if;
+
+    _user_org_config := organizations.config_by_org_id(_current_user_org_id);
+
+    _create_file_result := files.create_file(
+        object_key,
+        file_name,
+        _user_org_config.s3_bucket,
+        _user_org_config.s3_region,
+        mime_type,
+        size,
+        _current_user_org_id,
+        _current_user_id,
+        metadata
+    );
+
+    if _create_file_result.validation_failure_message is not null then
+        raise exception 'Application File Creation Failed'
+            using
+                detail = 'Invalid Request Payload',
+                hint = _create_file_result.validation_failure_message;
+    end if;
+
+    _create_application_file_result := applications.create_application_file(application_id, (_create_file_result.created_file).file_id, _current_user_id);
+    if _create_application_file_result.validation_failure_message is not null then
+        raise exception 'Application File Creation Failed'
+            using
+                detail = 'Invalid Request Payload',
+                hint = _create_application_file_result.validation_failure_message;
+    end if;
+
+    return jsonb_build_object(
+        'application_file', _create_application_file_result.created_application_file
+    );
+end;
+$$;
+
+grant execute on function api.create_application_file(bigint, text, text, text, bigint, jsonb) to authenticated;
+
+create or replace function api.application_files_by_client(application_id bigint) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_user_id bigint := auth.current_user_id();
+    _current_user_org_id bigint := auth.current_user_organization_id();
+    _current_user_role users.user_role := auth.current_user_role();
+    _organization_config organizations.organization_config := organizations.config_by_org_id(_current_user_org_id);
+    _application_files jsonb;
+begin
+    if (_current_user_role = 'org_client' and applications.application_user_id($1) != _current_user_id)
+    or (_current_user_role in ('org_admin', 'org_owner') and applications.application_organization_id($1) != _current_user_org_id) then
+        raise exception 'Application Files Retrieval Failed'
+            using
+                detail = 'You are not authorized to retrieve the application files for this application',
+                hint = 'unauthorized';
+    end if;
+
+    select
+        jsonb_agg(
+            jsonb_build_object(
+                'file_id', f.file_id,
+                'name', f.name,
+                'mime_type', f.mime_type,
+                'size', f.size,
+                'url', aws.generate_s3_presigned_url(
+                    _organization_config.s3_bucket,
+                    f.object_key,
+                    _organization_config.s3_region,
+                    'GET',
+                    3600
+                ),
+                'metadata', f.metadata,
+                'created_at', af.created_at,
+                'updated_at', af.updated_at
+            )
+        )
+    into
+        _application_files
+    from
+        applications.application_file af
+    join
+        files.file f
+    on
+        af.file_id = f.file_id
+    where
+        af.application_id = $1
+    and
+        users.user_role(af.created_by) = 'org_client';
+
+    return jsonb_build_object(
+        'application_files', coalesce(_application_files, '[]'::jsonb)
+    );
+end;
+$$;
+
+grant execute on function api.application_files_by_client(bigint) to authenticated;
+
+create or replace function api.application_files_by_admin(application_id bigint) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_user_id bigint := auth.current_user_id();
+    _current_user_org_id bigint := auth.current_user_organization_id();
+    _current_user_role users.user_role := auth.current_user_role();
+    _organization_config organizations.organization_config := organizations.config_by_org_id(_current_user_org_id);
+    _application_files jsonb;
+begin
+    if (_current_user_role = 'org_client' and applications.application_user_id($1) != _current_user_id)
+    or (_current_user_role in ('org_admin', 'org_owner') and applications.application_organization_id($1) != _current_user_org_id) then
+        raise exception 'Application Files Retrieval Failed'
+            using
+                detail = 'You are not authorized to retrieve the application files for this application',
+                hint = 'unauthorized';
+    end if;
+
+    select
+        jsonb_agg(
+            jsonb_build_object(
+                'file_id', f.file_id,
+                'name', f.name,
+                'mime_type', f.mime_type,
+                'size', f.size,
+                'url', aws.generate_s3_presigned_url(
+                    _organization_config.s3_bucket,
+                    f.object_key,
+                    _organization_config.s3_region,
+                    'GET',
+                    3600
+                ),
+                'metadata', f.metadata,
+                'created_at', af.created_at,
+                'updated_at', af.updated_at
+            )
+        )
+    into
+        _application_files
+    from
+        applications.application_file af
+    join
+        files.file f
+    on
+        af.file_id = f.file_id
+    where
+        af.application_id = $1
+    and
+        users.user_role(af.created_by) in ('org_admin', 'org_owner');
+
+    return jsonb_build_object(
+        'application_files', coalesce(_application_files, '[]'::jsonb)
+    );
+end;
+$$;
+
+grant execute on function api.application_files_by_admin(bigint) to authenticated;
 
 -- Views
 create or replace view api.applications as
