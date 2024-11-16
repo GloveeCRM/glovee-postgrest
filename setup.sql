@@ -1752,6 +1752,23 @@ create table applications.application (
     updated_at timestamp with time zone not null default now()
 );
 
+create table applications.application_update (
+    application_update_id bigint default utils.generate_random_id() not null primary key,
+    application_id bigint not null references applications.application(application_id) on delete cascade,
+    title text not null,
+    description text,
+    created_by bigint not null references users.user(user_id) on delete set null,
+    created_at timestamp with time zone not null default now()
+);
+
+create table applications.application_update_file (
+    application_update_file_id bigint default utils.generate_random_id() not null primary key,
+    application_update_id bigint not null references applications.application_update(application_update_id) on delete cascade,
+    file_id bigint not null references files.file(file_id) on delete cascade,
+    created_at timestamp with time zone not null default now()
+);
+
+
 create or replace function applications.application_user_id(_application_id bigint) returns bigint
     language sql
 as
@@ -1899,6 +1916,109 @@ begin
 end;
 $$;
 
+create or replace function applications.validate_create_application_update_input(
+    _application_id bigint,
+    _title text,
+    _created_by bigint,
+    _file_ids bigint[] default null
+) returns text
+    language plpgsql
+as
+$$
+declare
+    _current_user_org_id bigint := auth.current_user_organization_id();
+    _target_org_id bigint := applications.application_organization_id(_application_id);
+begin
+    if _application_id is null or _application_id <= 0 then
+        return 'missing_application_id';
+    end if;
+
+    if _title is null or _title = '' then
+        return 'missing_title';
+    end if;
+
+    if _created_by is null or _created_by <= 0 then
+        return 'missing_created_by';
+    end if;
+
+    if not exists (
+        select 1
+        from 
+            applications.application a
+        where 
+            a.application_id = _application_id
+        and 
+            _target_org_id = _current_user_org_id
+    ) then
+        return 'application_not_found';
+    end if;
+
+    if not exists (
+        select 1
+        from users.user u
+        where u.user_id = _created_by
+        and u.organization_id = _target_org_id
+    ) then
+        return 'user_not_found';
+    end if;
+
+    if _file_ids is not null then
+        if not exists (
+            select 1
+            from files.file f
+            where f.file_id = any(_file_ids)
+            and f.organization_id = _target_org_id
+        ) then
+            return 'file_not_found';
+        end if;
+    end if;
+
+    return null;
+end;
+$$;
+
+create or replace function applications.create_application_update(
+    _application_id bigint,
+    _title text,
+    _created_by bigint,
+    _description text default null,
+    _file_ids bigint[] default null,
+    out validation_failure_message text,
+    out created_application_update applications.application_update
+) returns record
+    language plpgsql
+    security definer
+as
+$$
+begin
+    validation_failure_message := applications.validate_create_application_update_input(_application_id, _title, _created_by, _file_ids);
+    if validation_failure_message is not null then
+        return;
+    end if;
+
+    -- Insert the application update
+    insert into 
+        applications.application_update (application_id, title, description, created_by)
+    values 
+        (_application_id, _title, _description, _created_by)
+    returning 
+        * 
+    into created_application_update;
+
+    -- Insert the application update files
+    if _file_ids is not null then
+        insert into 
+            applications.application_update_file (application_update_id, file_id)
+        select
+            created_application_update.application_update_id,
+            unnest(_file_ids);
+    end if;
+
+    return;
+end;
+$$;
+
+
 create or replace function api.create_application(user_id bigint) returns jsonb
     language plpgsql
     security definer
@@ -2017,6 +2137,7 @@ declare
     _user_org_config organizations.organization_config;
     _create_file_result record;
     _create_application_file_result record;
+    _create_application_update_result record;
 begin
     if _current_user_role = 'org_client' and _target_user_id != _current_user_id then
         raise exception 'Application File Creation Failed'
@@ -2052,6 +2173,20 @@ begin
             using
                 detail = 'Invalid Request Payload',
                 hint = _create_application_file_result.validation_failure_message;
+    end if;
+
+    _create_application_update_result := applications.create_application_update(
+        application_id,
+        'File Uploaded',
+        _current_user_id, 
+        null, 
+        array[(_create_file_result.created_file).file_id]
+    );
+    if _create_application_update_result.validation_failure_message is not null then
+        raise exception 'Application File Creation Failed'
+            using
+                detail = 'Invalid Request Payload',
+                hint = _create_application_update_result.validation_failure_message;
     end if;
 
     return jsonb_build_object(
@@ -2181,6 +2316,100 @@ end;
 $$;
 
 grant execute on function api.application_files_by_admin(bigint) to authenticated;
+
+create or replace function api.application_updates(application_id bigint) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_user_id bigint := auth.current_user_id();
+    _current_user_org_id bigint := auth.current_user_organization_id();
+    _current_user_role users.user_role := auth.current_user_role();
+    _organization_config organizations.organization_config := organizations.config_by_org_id(_current_user_org_id);
+    _application_updates jsonb;
+begin
+    if (_current_user_role = 'org_client' and applications.application_user_id($1) != _current_user_id)
+    or (_current_user_role in ('org_admin', 'org_owner') and applications.application_organization_id($1) != _current_user_org_id) then
+        raise exception 'Application Updates Retrieval Failed'
+            using
+                detail = 'You are not authorized to retrieve the application updates for this application',
+                hint = 'unauthorized';
+    end if;
+
+    with update_files as (
+        select 
+            au.application_update_id,
+            jsonb_agg(
+                jsonb_build_object(
+                    'file_id', f.file_id,
+                    'name', f.name,
+                    'mime_type', f.mime_type,
+                    'url', aws.generate_s3_presigned_url(
+                        _organization_config.s3_bucket,
+                        f.object_key,
+                        _organization_config.s3_region,
+                        'GET',
+                        3600
+                    )
+                )
+            ) as files
+        from 
+            applications.application_update au
+        join
+            applications.application_update_file aup
+        on
+            au.application_update_id = aup.application_update_id
+        join
+            files.file f
+        on
+            aup.file_id = f.file_id
+        where
+            au.application_id = $1
+        group by
+            au.application_update_id
+    )
+    select
+        jsonb_agg(
+            jsonb_build_object(
+                'application_update_id', au.application_update_id,
+                'title', au.title,
+                'description', au.description,
+                'created_at', au.created_at,
+                'created_by', jsonb_build_object(
+                    'user_id', u.user_id,
+                    'role', users.user_role(au.created_by),
+                    'email', u.email,
+                    'first_name', u.first_name,
+                    'last_name', u.last_name,
+                    'full_name', concat(u.first_name, ' ', u.last_name)
+                ),
+                'files', coalesce(uf.files, '[]'::jsonb)
+            )
+            order by au.created_at desc
+        )
+    into 
+        _application_updates
+    from 
+        applications.application_update au
+    join
+        users.user u
+    on
+        au.created_by = u.user_id
+    left join
+        update_files uf
+    on
+        au.application_update_id = uf.application_update_id
+    where
+        au.application_id = $1;
+
+    return jsonb_build_object(
+        'application_updates', coalesce(_application_updates, '[]'::jsonb)
+    );
+end;
+$$;
+
+grant execute on function api.application_updates(bigint) to authenticated;
 
 -- Views
 create or replace view api.applications as

@@ -25,9 +25,17 @@ end$$;
 
 begin;
 -- Drop Application Files
+drop function if exists api.application_updates(bigint);
+drop function if exists api.application_file_upload_url(bigint, text, text);
+drop function if exists api.application_files_by_client(bigint);
+drop function if exists api.application_files_by_admin(bigint);
 drop function if exists api.create_application_file(bigint, text, text, text, bigint, jsonb);
-drop function if exists applications.create_application_file(bigint, bigint, bigint);
 drop function if exists applications.validate_create_application_file_input(bigint, bigint, bigint);
+drop function if exists applications.create_application_file(bigint, bigint, bigint);
+drop function if exists applications.validate_create_application_update_input(bigint, text, bigint, bigint[]);
+drop function if exists applications.create_application_update(bigint, text, bigint, text, bigint[], out text, out applications.application_update);
+drop table if exists applications.application_update;
+drop table if exists applications.application_update_file;
 drop table if exists applications.application_file;
 
 -- Drop Applications
@@ -36,6 +44,7 @@ drop function if exists api.create_application(bigint);
 drop function if exists applications.create_application(bigint);
 drop function if exists applications.validate_create_application_input(bigint);
 drop function if exists applications.application_user_id(bigint);
+drop function if exists applications.application_organization_id(bigint);
 drop table if exists applications.application;
 drop schema if exists applications cascade;
 
