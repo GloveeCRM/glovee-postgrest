@@ -24,6 +24,12 @@ exception when undefined_function or undefined_object then null;
 end$$;
 
 begin;
+-- Drop Forms
+drop view if exists api.form_templates;
+drop function if exists api.create_form_template(text);
+drop function if exists forms.create_form_template(bigint, text, bigint);
+drop function if exists forms.validate_create_form_template_input(bigint, text, bigint);
+
 -- Drop Application Files
 drop function if exists api.application_updates(bigint);
 drop function if exists api.application_file_upload_url(bigint, text, text);
@@ -60,6 +66,7 @@ drop function if exists files.create_file(text, text, text, text, text, bigint, 
 drop function if exists files.validate_create_file_input(text, text, text, text, text, bigint, bigint, bigint, boolean, jsonb);
 drop function if exists files.get_file_extension_from_mimetype(text);
 drop function if exists files.generate_object_key(bigint, text, text, text, bigint);
+drop function if exists files.generate_url(bigint);
 
 -- Drop API functionss
 drop function if exists api.create_user_profile_picture(bigint, text, text, text, bigint, jsonb);
@@ -80,6 +87,7 @@ drop function if exists users.create_user_status(bigint, users.user_status);
 drop function if exists users.validate_create_user_status_input(bigint, users.user_status);
 drop function if exists users.create_user(text, text, text, text, text, users.user_role);
 drop function if exists users.validate_create_user_input(text, text, text, text, text, users.user_role);
+drop function if exists users.profile_picture_url(bigint);
 drop function if exists users.user_organization_id(bigint);
 
 -- Drop auth functions
@@ -111,6 +119,8 @@ drop function if exists organizations.org_id_by_org_name(text);
 alter table if exists organizations.organization drop constraint if exists logo_file_id_fk;
 alter table if exists users.user drop constraint if exists profile_picture_file_id_fk;
 
+drop table if exists forms.form cascade;
+drop table if exists forms.form_template cascade;
 drop table if exists config.config cascade;
 drop table if exists files.file cascade;
 drop table if exists organizations.organization_config cascade;
@@ -132,6 +142,7 @@ drop extension if exists aws_commons cascade;
 drop extension if exists aws_lambda cascade;
 
 -- Drop schemas
+drop schema if exists forms cascade;
 drop schema if exists files cascade;
 drop schema if exists utils cascade;
 drop schema if exists auth cascade;

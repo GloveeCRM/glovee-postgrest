@@ -715,6 +715,25 @@ $$;
 
 grant execute on function users.user_status(bigint) to anon, authenticated;
 
+create or replace function users.profile_picture_url(_user_id bigint) returns text
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _file_id bigint;
+begin
+    select profile_picture_file_id
+    into _file_id
+    from users.user
+    where user_id = _user_id;
+
+    return files.generate_url(_file_id);
+end;
+$$;
+
+grant execute on function users.profile_picture_url(bigint) to authenticated;
+
 create function users.validate_create_user_input(_first_name text, _last_name text, _email text, _password text, _org_name text, _role users.user_role DEFAULT 'org_client') returns text
     language plpgsql
 as
@@ -1105,6 +1124,36 @@ $$;
 grant execute on function aws.generate_s3_presigned_url(text, text, text, text, int) to anon, authenticated;
 
 -- Files
+create or replace function files.generate_url(_file_id bigint) returns text
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _file files.file;
+    _target_org_id bigint := auth.current_user_organization_id();
+    _organization_config organizations.organization_config := organizations.config_by_org_id(_target_org_id);
+begin
+    select *
+    into _file
+    from files.file
+    where file_id = _file_id
+    and organization_id = _target_org_id;
+
+    if not found then
+        return null;
+    end if;
+
+    return aws.generate_s3_presigned_url(
+        _organization_config.s3_bucket,
+        _file.object_key,
+        _organization_config.s3_region,
+        'GET',
+        360
+    );
+end;
+$$;
+
 create or replace function files.get_file_extension_from_mimetype(_mime_type text)
 returns text
 language plpgsql
@@ -2421,7 +2470,8 @@ select
         'email', u.email,
         'first_name', u.first_name,
         'last_name', u.last_name,
-        'full_name', concat(u.first_name, ' ', u.last_name)
+        'full_name', concat(u.first_name, ' ', u.last_name),
+        'profile_picture_url', users.profile_picture_url(u.user_id)
     ) as owner,
     a.created_at,
     a.updated_at
@@ -2485,5 +2535,148 @@ insert into users.account_role (user_id, role) values
 insert into users.account_status (user_id, status) values
     (1111111, 'active'),
     (2222222, 'active');
+
+commit;
+
+begin;
+-- Create a schema for forms
+create schema if not exists forms;
+
+create table if not exists forms.form (
+    form_id bigint default utils.generate_random_id() not null primary key,
+    created_by bigint references users.user(user_id) on delete set null,
+    created_at timestamp with time zone default now() not null
+);
+
+create table if not exists forms.form_template (
+    form_template_id bigint default utils.generate_random_id() not null primary key,
+    organization_id bigint references organizations.organization(organization_id) on delete cascade,
+    form_id bigint references forms.form(form_id) on delete cascade,
+    template_name text not null,
+    created_by bigint references users.user(user_id) on delete set null,
+    created_at timestamp with time zone default now() not null
+);
+
+create or replace function forms.validate_create_form_template_input(
+    _created_by bigint,
+    _template_name text,
+    _organization_id bigint
+) returns text
+    language plpgsql
+    security definer
+as
+$$
+begin
+    if _created_by is null or _created_by <= 0 then
+        return 'missing_created_by';
+    end if;
+
+    if _template_name is null or _template_name = '' then
+        return 'missing_template_name';
+    end if;
+
+    if _organization_id is null or _organization_id <= 0 then
+        return 'missing_organization_id';
+    end if;
+
+    if not exists (
+        select 
+            1
+        from 
+            users.user u
+        where 
+            u.user_id = _created_by
+        and 
+            u.organization_id = _organization_id
+    ) then
+        return 'user_not_found';
+    end if;
+
+    return null;
+end;
+$$;
+
+create or replace function forms.create_form_template(
+    _created_by bigint,
+    _template_name text,
+    _organization_id bigint,
+    out validation_failure_message text,
+    out created_form forms.form,
+    out created_form_template forms.form_template
+) returns record
+    language plpgsql
+    security definer
+as
+$$
+begin
+    validation_failure_message := forms.validate_create_form_template_input(_created_by, _template_name, _organization_id);
+    if validation_failure_message is not null then
+        return;
+    end if;
+
+    -- Create the form
+    insert into 
+        forms.form (created_by) 
+    values 
+        (_created_by)
+    returning * into created_form;
+
+    -- Create the form template
+    insert into 
+        forms.form_template (form_id, template_name, organization_id, created_by)
+    values
+        (created_form.form_id, _template_name, _organization_id, _created_by)
+    returning * into created_form_template;
+
+    return;
+end;
+$$;
+
+create or replace function api.create_form_template(template_name text) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_user_id bigint := auth.current_user_id();
+    _current_user_role users.user_role := auth.current_user_role();
+    _current_user_org_id bigint := auth.current_user_organization_id();
+    _create_form_result record;
+begin
+    if _current_user_role not in ('org_admin', 'org_owner') then
+        raise exception 'Form Template Creation Failed'
+            using
+                detail = 'You are not authorized to create a form template',
+                hint = 'unauthorized';
+    end if;
+
+    _create_form_result := forms.create_form_template(_current_user_id, template_name, _current_user_org_id);
+    if _create_form_result.validation_failure_message is not null then
+        raise exception 'Form Template Creation Failed'
+            using
+                detail = 'Invalid Request Payload',
+                hint = _create_form_result.validation_failure_message;
+    end if;
+
+    return jsonb_build_object(
+        'form_template', _create_form_result.created_form_template
+    );
+end;
+$$;
+
+grant execute on function api.create_form_template(text) to authenticated;
+
+create or replace view api.form_templates as
+select
+    ft.form_template_id,
+    ft.organization_id,
+    ft.form_id,
+    ft.template_name,
+    ft.created_by,
+    ft.created_at
+from forms.form_template ft
+where ft.organization_id = auth.current_user_organization_id();
+
+grant select on api.form_templates to authenticated;
 
 commit;
