@@ -2666,6 +2666,128 @@ $$;
 
 grant execute on function api.create_form_template(text) to authenticated;
 
+create or replace function forms.validate_update_form_template_input(
+    _form_template_id bigint,
+    _template_name text
+) returns text
+    language plpgsql
+    security definer
+as
+$$
+begin
+    if _form_template_id is null or _form_template_id <= 0 then
+        return 'missing_form_template_id';
+    end if;
+
+    if _template_name is null or _template_name = '' then
+        return 'missing_template_name';
+    end if;
+
+    if not exists (
+        select 
+            1
+        from 
+            forms.form_template ft
+        where 
+            ft.form_template_id = _form_template_id
+    ) then
+        return 'form_template_not_found';
+    end if;
+
+    return null;
+end;
+$$;
+
+create or replace function forms.update_form_template(
+    _form_template_id bigint,
+    _template_name text,
+    out validation_failure_message text,
+    out updated_form_template forms.form_template
+) returns record
+    language plpgsql
+    security definer
+as
+$$
+begin
+    validation_failure_message := forms.validate_update_form_template_input(_form_template_id, _template_name);
+    if validation_failure_message is not null then
+        return;
+    end if;
+
+    update 
+        forms.form_template
+    set 
+        template_name = _template_name
+    where 
+        form_template_id = _form_template_id
+    and
+        organization_id = auth.current_user_organization_id()
+    returning * into updated_form_template;
+
+    return;
+end;
+$$;
+
+create or replace function api.update_form_template(form_template_id bigint, template_name text) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_user_role users.user_role := auth.current_user_role();
+    _update_form_template_result record;
+begin
+    if _current_user_role not in ('org_admin', 'org_owner') then
+        raise exception 'Form Template Update Failed'
+            using
+                detail = 'You are not authorized to update this form template',
+                hint = 'unauthorized';
+    end if;
+
+    _update_form_template_result := forms.update_form_template(form_template_id, template_name);
+    if _update_form_template_result.validation_failure_message is not null then
+        raise exception 'Form Template Update Failed'
+            using
+                detail = 'Invalid Request Payload',
+                hint = _update_form_template_result.validation_failure_message;
+    end if;
+
+    return jsonb_build_object(
+        'form_template', _update_form_template_result.updated_form_template
+    );
+end;
+$$;
+
+grant execute on function api.update_form_template(bigint, text) to authenticated;
+
+create or replace function api.delete_form_template(form_template_id bigint) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_user_role users.user_role := auth.current_user_role();
+begin
+    if _current_user_role not in ('org_admin', 'org_owner') then
+        raise exception 'Form Template Deletion Failed'
+            using
+                detail = 'You are not authorized to delete this form template',
+                hint = 'unauthorized';
+    end if;
+
+    delete from
+        forms.form_template ft
+    where
+        ft.form_template_id = $1
+    and
+        ft.organization_id = auth.current_user_organization_id();
+
+    return jsonb_build_object('success', true);
+end;
+$$;
+
+grant execute on function api.delete_form_template(bigint) to authenticated;
+
 create or replace view api.form_templates as
 select
     ft.form_template_id,

@@ -24,8 +24,13 @@ exception when undefined_function or undefined_object then null;
 end$$;
 
 begin;
+
 -- Drop Forms
 drop view if exists api.form_templates;
+drop function if exists api.delete_form_template(bigint);
+drop function if exists api.update_form_template(bigint, text);
+drop function if exists forms.update_form_template(bigint, text);
+drop function if exists forms.validate_update_form_template_input(bigint, text);
 drop function if exists api.create_form_template(text);
 drop function if exists forms.create_form_template(bigint, text, bigint);
 drop function if exists forms.validate_create_form_template_input(bigint, text, bigint);
