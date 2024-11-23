@@ -26,6 +26,9 @@ end$$;
 begin;
 
 -- Drop Forms
+drop function if exists forms.form_category_position_by_form_category_id(bigint);
+drop function if exists forms.form_id_by_form_category_id(bigint);
+drop function if exists api.delete_form_template_category(bigint);
 drop function if exists forms.validate_update_form_categories_input(jsonb[]);
 drop function if exists forms.update_form_categories(jsonb[]);
 drop function if exists api.update_form_template_categories(jsonb[]);

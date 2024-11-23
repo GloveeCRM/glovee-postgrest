@@ -3146,4 +3146,73 @@ end;
 $$;
 
 grant execute on function api.update_form_template_categories(jsonb[]) to authenticated;
+
+create or replace function api.delete_form_template_category(form_category_id bigint) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_user_role users.user_role := auth.current_user_role();
+    _target_org_id bigint := auth.current_user_organization_id();
+    _target_form_id bigint := forms.form_id_by_form_category_id(form_category_id);
+    _target_form_category_position int := forms.form_category_position_by_form_category_id(form_category_id);
+    _remaining_form_categories jsonb;
+begin
+    if _current_user_role not in ('org_admin', 'org_owner') then
+        raise exception 'Form Template Category Deletion Failed'
+            using
+                detail = 'You are not authorized to delete this form template category',
+                hint = 'unauthorized';
+    end if;
+
+    delete from forms.form_category fc
+    using forms.form f,
+          forms.form_template ft
+    where fc.form_category_id = $1
+    and f.form_id = ft.form_id
+    and ft.organization_id = _target_org_id;
+
+    if not found then
+        raise exception 'Form Template Category Deletion Failed'
+            using
+                detail = 'Form Template Category not found',
+                hint = 'template_category_not_found';
+    end if;
+
+    -- Reorder the categories
+    update forms.form_category fc
+    set category_position = fc.category_position - 1
+    where fc.form_id = _target_form_id
+    and fc.category_position > _target_form_category_position;
+
+    -- Return remaining form categories
+    select json_agg(fc) into _remaining_form_categories
+    from forms.form_category fc
+    where fc.form_id = _target_form_id;
+
+    return jsonb_build_object(
+        'form_categories', _remaining_form_categories
+    );
+end;
+$$;
+
+grant execute on function api.delete_form_template_category(bigint) to authenticated;
+
+create or replace function forms.form_category_position_by_form_category_id(_form_category_id bigint) returns int
+    language sql
+    stable
+as
+$$
+select category_position from forms.form_category where form_category_id = _form_category_id;
+$$;
+
+create or replace function forms.form_id_by_form_category_id(_form_category_id bigint) returns bigint
+    language sql
+    stable
+as
+$$
+select form_id from forms.form_category where form_category_id = _form_category_id;
+$$;
+
 commit;
