@@ -26,6 +26,17 @@ end$$;
 begin;
 
 -- Drop Forms
+drop function if exists api.delete_form_section(bigint);
+drop function if exists forms.form_category_id_by_form_section_id(bigint);
+drop function if exists forms.form_section_position_by_form_section_id(bigint);
+drop function if exists api.update_form_template_sections(jsonb[]);
+drop function if exists forms.update_form_sections(jsonb[]);
+drop function if exists forms.validate_update_form_section_input(jsonb[]);
+drop function if exists api.form_template_sections(bigint);
+drop function if exists api.create_form_section(bigint, text, int);
+drop function if exists forms.create_form_section(bigint, text, int);
+drop function if exists forms.validate_create_form_section_input(bigint, text, int);
+drop function if exists forms.form_organization_id(bigint);
 drop function if exists forms.form_category_position_by_form_category_id(bigint);
 drop function if exists forms.form_id_by_form_category_id(bigint);
 drop function if exists api.delete_form_template_category(bigint);
@@ -135,6 +146,7 @@ drop function if exists organizations.org_id_by_org_name(text);
 alter table if exists organizations.organization drop constraint if exists logo_file_id_fk;
 alter table if exists users.user drop constraint if exists profile_picture_file_id_fk;
 
+drop table if exists forms.form_section;
 drop table if exists forms.form_category;
 drop table if exists forms.form cascade;
 drop table if exists forms.form_template cascade;

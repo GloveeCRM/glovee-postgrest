@@ -3094,18 +3094,19 @@ begin
     from unnest(form_categories) as c;
 
     -- Perform updates and store results
-    with updates as (
-        update forms.form_category fc
-        set 
-            category_name = tc.category_name,
-            category_position = tc.category_position
-        from temp_categories tc
-        where fc.form_category_id = tc.form_category_id
-        and fc.form_id = _form_id
-        returning fc.*
-    )
-    select array_agg(updates.*) into updated_form_categories
-    from updates;
+    update forms.form_category fc
+    set 
+        category_name = tc.category_name,
+        category_position = tc.category_position
+    from temp_categories tc
+    where fc.form_category_id = tc.form_category_id
+    and fc.form_id = _form_id;
+
+    -- Return ALL categories for the form, not just updated ones
+    select array_agg(fc.* order by fc.category_position)
+    into updated_form_categories
+    from forms.form_category fc
+    where fc.form_id = _form_id;
 
     -- Cleanup
     drop table if exists temp_categories;
@@ -3214,5 +3215,410 @@ as
 $$
 select form_id from forms.form_category where form_category_id = _form_category_id;
 $$;
+
+create table if not exists forms.form_section (
+    form_section_id bigint default utils.generate_random_id() not null primary key,
+    form_category_id bigint references forms.form_category(form_category_id) on delete cascade,
+    section_name text not null,
+    section_position int not null check (section_position > 0),
+    created_at timestamp with time zone default now() not null,
+    unique (form_category_id, section_position)
+);
+
+create or replace function forms.form_organization_id(_form_id bigint) returns bigint
+    language sql
+    stable
+as
+$$
+    select ft.organization_id
+    from forms.form f
+    join forms.form_template ft 
+    on f.form_id = ft.form_id
+    where f.form_id = _form_id;
+$$;
+
+create or replace function forms.validate_create_form_section_input(
+    _form_category_id bigint,
+    _section_name text,
+    _section_position int
+) returns text
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _target_org_id bigint := auth.current_user_organization_id();
+begin
+    if _form_category_id is null or _form_category_id <= 0 then
+        return 'missing_form_category_id';
+    end if;
+
+    if _section_name is null or _section_name = '' then
+        return 'missing_section_name';
+    end if;
+
+    if _section_position is null or _section_position < 1 then
+        return 'missing_section_position';
+    end if;
+
+    if not exists (
+        select 1
+        from forms.form_category fc
+        where fc.form_category_id = _form_category_id
+        and forms.form_organization_id(fc.form_id) = _target_org_id
+    ) then
+        return 'form_category_not_found';
+    end if;
+
+    if exists (
+        select 1
+        from forms.form_section fs
+        where fs.form_category_id = _form_category_id
+        and fs.section_position = _section_position
+    ) then
+        return 'section_position_already_exists';
+    end if;
+
+    return null;
+end;
+$$;
+
+create or replace function forms.create_form_section(
+    _form_category_id bigint,
+    _section_name text,
+    _section_position int,
+    out validation_failure_message text,
+    out created_form_section forms.form_section
+) returns record
+    language plpgsql
+    security definer
+as
+$$
+begin
+    validation_failure_message := forms.validate_create_form_section_input(_form_category_id, _section_name, _section_position);
+    if validation_failure_message is not null then
+        return;
+    end if;
+
+    insert into 
+        forms.form_section (form_category_id, section_name, section_position)
+    values
+        (_form_category_id, _section_name, _section_position)
+    returning * into created_form_section;
+
+    return;
+end;
+$$;
+
+create or replace function api.create_form_section(form_category_id bigint, section_name text, section_position int) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_user_role users.user_role := auth.current_user_role();
+    _create_form_section_result record;
+begin
+    if _current_user_role not in ('org_admin', 'org_owner') then
+        raise exception 'Form Section Creation Failed'
+            using
+                detail = 'You are not authorized to create a form section',
+                hint = 'unauthorized';
+    end if;
+
+    _create_form_section_result := forms.create_form_section(form_category_id, section_name, section_position);
+    if _create_form_section_result.validation_failure_message is not null then
+        raise exception 'Form Section Creation Failed'
+            using
+                detail = 'Invalid Request Payload',
+                hint = _create_form_section_result.validation_failure_message;
+    end if;
+
+    return jsonb_build_object(
+        'form_section', _create_form_section_result.created_form_section
+    );
+end;
+$$;
+
+grant execute on function api.create_form_section(bigint, text, int) to authenticated;
+
+create or replace function api.form_template_sections(form_template_id bigint) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_user_role users.user_role := auth.current_user_role();
+    _target_org_id bigint := auth.current_user_organization_id();
+    _form_sections jsonb;
+begin
+    if _current_user_role not in ('org_admin', 'org_owner') then
+        raise exception 'Form Sections Retrieval Failed'
+            using
+                detail = 'You are not authorized to retrieve the form sections',
+                hint = 'unauthorized';
+    end if;
+
+    select
+        jsonb_agg(fs)
+    into
+        _form_sections
+    from 
+        forms.form_section fs
+    join
+        forms.form_category fc on fs.form_category_id = fc.form_category_id
+    join
+        forms.form f on fc.form_id = f.form_id
+    join
+        forms.form_template ft on f.form_id = ft.form_id
+    where
+        ft.form_template_id = $1
+    and
+        ft.organization_id = _target_org_id;
+
+    return coalesce(_form_sections, '[]'::jsonb);
+end;
+$$;
+
+grant execute on function api.form_template_sections(bigint) to authenticated;
+
+create or replace function forms.validate_update_form_section_input(_form_sections jsonb[]) returns text
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _required_fields text[] := array['form_section_id', 'form_category_id', 'section_name', 'section_position'];
+    _distinct_form_category_ids bigint[];
+    _form_section jsonb;
+    _field_name text;
+    _form_category_id bigint;
+begin
+    if array_length(_form_sections, 1) is null then
+        return 'missing_form_sections';
+    end if;
+
+    -- Validate all form_category_ids are the same
+    select array_agg(distinct (c->>'form_category_id')::bigint)
+    into _distinct_form_category_ids
+    from unnest(_form_sections) as c;
+
+    -- Check if we have exactly one form_category_id that's not null
+    if array_length(_distinct_form_category_ids, 1) != 1 or _distinct_form_category_ids[1] is null then
+        return 'distinct_form_category_id_not_found';
+    end if;
+
+    _form_category_id := _distinct_form_category_ids[1];
+
+    -- Validate all required fields are present
+    foreach _form_section in array _form_sections loop
+        foreach _field_name in array _required_fields loop
+            if not _form_section ? _field_name then
+                return 'missing_' || _field_name;
+            end if;
+        end loop;
+
+        -- Validate section_position positive integer
+        if (_form_section->>'section_position')::int is null or (_form_section->>'section_position')::int < 1 then
+            return 'invalid_section_position';
+        end if;
+
+        -- Validate section_name is not empty
+        if trim(_form_section->>'section_name') = '' then
+            return 'invalid_section_name';
+        end if;
+    end loop;
+
+    -- Validate section_position is unique
+    if exists (
+        select 1
+        from unnest(_form_sections) c1
+        join unnest(_form_sections) c2 on 
+            (c1->>'section_position')::int = (c2->>'section_position')::int
+            and c1->>'form_section_id' != c2->>'form_section_id'
+    ) then
+        return 'non_unique_section_position';
+    end if;
+
+    -- Validate form_section_ids exist and belong to the correct form_category
+    if exists (
+        select 1
+        from unnest(_form_sections) c
+        where not exists (
+            select 1 from forms.form_section fs where fs.form_section_id = (c->>'form_section_id')::bigint and fs.form_category_id = _form_category_id
+        )
+    ) then
+        return 'invalid_form_section_id';
+    end if;
+
+    return null;
+end;
+$$;
+
+create or replace function forms.update_form_sections(
+    form_sections jsonb[],
+    out validation_failure_message text,
+    out updated_form_sections forms.form_section[]
+) returns record
+    language plpgsql
+    security definer
+as $$
+declare
+    _form_category_id bigint;
+    _form_id bigint;
+begin
+    validation_failure_message := forms.validate_update_form_section_input(form_sections);
+    if validation_failure_message is not null then
+        return;
+    end if;
+
+    select (form_sections[1]->>'form_category_id')::bigint into _form_category_id;
+    select forms.form_id_by_form_category_id(_form_category_id) into _form_id;
+
+    create temp table temp_sections (
+        form_section_id bigint,
+        section_name text,
+        section_position int
+    ) on commit drop;
+
+    insert into temp_sections (
+        form_section_id,
+        section_name,
+        section_position
+    )
+
+    select 
+        (c->>'form_section_id')::bigint,
+        c->>'section_name',
+        (c->>'section_position')::int
+    from unnest(form_sections) as c;
+
+    update forms.form_section fs
+    set
+        section_name = ts.section_name,
+        section_position = ts.section_position
+    from temp_sections ts
+    where fs.form_section_id = ts.form_section_id
+    and fs.form_category_id = _form_category_id;
+
+    -- Return ALL sections for the form
+    select array_agg(fs.* order by fc.category_position, fs.section_position)
+    into updated_form_sections
+    from forms.form_section fs
+    join forms.form_category fc on fc.form_category_id = fs.form_category_id
+    where fc.form_id = _form_id;
+
+    drop table if exists temp_sections;
+end;
+$$;
+
+create or replace function api.update_form_template_sections(form_sections jsonb[]) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_user_role users.user_role := auth.current_user_role();
+    _update_form_sections_result record;
+begin
+    if _current_user_role not in ('org_admin', 'org_owner') then
+        raise exception 'Form Template Sections Update Failed'
+            using
+                detail = 'You are not authorized to update the form template sections',
+                hint = 'unauthorized';
+    end if;
+
+    _update_form_sections_result := forms.update_form_sections(form_sections);
+    if _update_form_sections_result.validation_failure_message is not null then
+        raise exception 'Form Template Sections Update Failed'
+            using
+                detail = 'Invalid Request Payload',
+                hint = _update_form_sections_result.validation_failure_message;
+    end if;
+
+    return jsonb_build_object(
+        'form_sections', coalesce(
+            to_jsonb(_update_form_sections_result.updated_form_sections),
+            '[]'::jsonb
+        )
+    );
+end;
+$$;
+
+grant execute on function api.update_form_template_sections(jsonb[]) to authenticated;
+
+create or replace function forms.form_section_position_by_form_section_id(_form_section_id bigint) returns int
+    language sql
+    stable
+as
+$$
+select section_position from forms.form_section where form_section_id = _form_section_id;
+$$;
+
+create or replace function forms.form_category_id_by_form_section_id(_form_section_id bigint) returns bigint
+    language sql
+    stable
+as
+$$
+select form_category_id from forms.form_section where form_section_id = _form_section_id;
+$$;
+
+create or replace function api.delete_form_template_section(form_section_id bigint) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_user_role users.user_role := auth.current_user_role();
+    _target_org_id bigint := auth.current_user_organization_id();
+    _target_form_section_position int := forms.form_section_position_by_form_section_id(form_section_id);
+    _target_form_category_id bigint := forms.form_category_id_by_form_section_id(form_section_id);
+    _target_form_id bigint := forms.form_id_by_form_category_id(_target_form_category_id);
+    _remaining_form_sections jsonb;
+begin
+    if _current_user_role not in ('org_admin', 'org_owner') then
+        raise exception 'Form Template Section Deletion Failed'
+            using
+                detail = 'You are not authorized to delete this form template section',
+                hint = 'unauthorized';
+    end if;
+
+    delete from forms.form_section fs
+    using forms.form_category fc,
+          forms.form f,
+          forms.form_template ft
+    where fs.form_section_id = $1
+    and fc.form_category_id = fs.form_category_id
+    and f.form_id = fc.form_id
+    and ft.form_id = f.form_id
+    and ft.organization_id = _target_org_id;
+
+    if not found then
+        raise exception 'Form Template Section Deletion Failed'
+            using
+                detail = 'Form Template Section not found',
+                hint = 'section_not_found';
+    end if;
+
+    -- Reorder the sections in the form_category
+    update forms.form_section fs
+    set section_position = fs.section_position - 1
+    where fs.form_category_id = _target_form_category_id
+    and fs.section_position > _target_form_section_position;
+
+    -- Return remaining form sections
+    select json_agg(fs order by fc.category_position, fs.section_position) into _remaining_form_sections
+    from forms.form_section fs
+    join forms.form_category fc on fc.form_category_id = fs.form_category_id
+    join forms.form f on fc.form_id = f.form_id
+    join forms.form_template ft on f.form_id = ft.form_id
+    where fc.form_id = _target_form_id
+    and ft.organization_id = _target_org_id;
+
+    return jsonb_build_object('form_sections', _remaining_form_sections);
+end;
+$$;
+
+grant execute on function api.delete_form_template_section(bigint) to authenticated;
 
 commit;
