@@ -26,6 +26,14 @@ end$$;
 begin;
 
 -- Drop Forms
+drop function if exists forms.validate_update_form_categories_input(jsonb[]);
+drop function if exists forms.update_form_categories(jsonb[]);
+drop function if exists api.update_form_template_categories(jsonb[]);
+drop function if exists api.form_template_categories(bigint);
+drop function if exists api.create_form_template_category(bigint, text, int);
+drop function if exists forms.create_form_category(bigint, text, int);
+drop function if exists forms.validate_create_form_category_input(bigint, text, int);
+drop function if exists forms.form_id_by_form_template_id(bigint);
 drop view if exists api.form_templates;
 drop function if exists api.delete_form_template(bigint);
 drop function if exists api.update_form_template(bigint, text);
@@ -124,6 +132,7 @@ drop function if exists organizations.org_id_by_org_name(text);
 alter table if exists organizations.organization drop constraint if exists logo_file_id_fk;
 alter table if exists users.user drop constraint if exists profile_picture_file_id_fk;
 
+drop table if exists forms.form_category;
 drop table if exists forms.form cascade;
 drop table if exists forms.form_template cascade;
 drop table if exists config.config cascade;

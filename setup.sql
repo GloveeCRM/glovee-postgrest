@@ -2801,4 +2801,349 @@ where ft.organization_id = auth.current_user_organization_id();
 
 grant select on api.form_templates to authenticated;
 
+-- Form Category
+create table if not exists forms.form_category (
+    form_category_id bigint default utils.generate_random_id() not null primary key,
+    form_id bigint references forms.form(form_id) on delete cascade,
+    category_name text not null,
+    category_position int not null check (category_position > 0),
+    created_at timestamp with time zone default now() not null,
+    unique (form_id, category_position)
+);
+
+create or replace function forms.validate_create_form_category_input(
+    _form_id bigint,
+    _category_name text,
+    _category_position int
+) returns text
+    language plpgsql
+    security definer
+as
+$$
+begin
+    if _form_id is null or _form_id <= 0 then
+        return 'missing_form_id';
+    end if;
+
+    if _category_name is null or _category_name = '' then
+        return 'missing_category_name';
+    end if;
+
+    if _category_position is null or _category_position < 1 then
+        return 'missing_category_position';
+    end if;
+
+    if not exists (
+        select
+            1
+        from
+            forms.form f
+        join
+            forms.form_template ft
+        on
+            f.form_id = ft.form_id
+        where
+            f.form_id = _form_id
+        and
+            ft.organization_id = auth.current_user_organization_id()
+    ) then
+        return 'form_not_found';
+    end if;
+
+    if exists (
+        select
+            1
+        from
+            forms.form_category fc
+        where
+            fc.form_id = _form_id and fc.category_position = _category_position
+    ) then
+        return 'category_position_already_exists';
+    end if;
+
+    return null;
+end;
+$$;
+
+create or replace function forms.create_form_category(
+    _form_id bigint,
+    _category_name text,
+    _category_position int,
+    out validation_failure_message text,
+    out created_form_category forms.form_category
+) returns record
+    language plpgsql
+    security definer
+as
+$$
+begin
+    validation_failure_message := forms.validate_create_form_category_input(_form_id, _category_name, _category_position);
+    if validation_failure_message is not null then
+        return;
+    end if;
+
+    insert into
+        forms.form_category (form_id, category_name, category_position)
+    values
+        (_form_id, _category_name, _category_position)
+    returning * into created_form_category;
+
+    return;
+end;
+$$;
+
+create or replace function forms.form_id_by_form_template_id(_form_template_id bigint) returns bigint
+    language sql
+    stable
+as
+$$
+select form_id from forms.form_template where form_template_id = _form_template_id;
+$$;
+
+create or replace function api.create_form_template_category(form_template_id bigint, category_name text, category_position int) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_user_role users.user_role := auth.current_user_role();
+    _form_id bigint := forms.form_id_by_form_template_id(form_template_id);
+    _create_form_category_result record;
+begin
+    if _current_user_role not in ('org_admin', 'org_owner') then
+        raise exception 'Form Category Creation Failed'
+            using
+                detail = 'You are not authorized to create a form category',
+                hint = 'unauthorized';
+    end if;
+
+    _create_form_category_result := forms.create_form_category(_form_id, category_name, category_position);
+    if _create_form_category_result.validation_failure_message is not null then
+        raise exception 'Form Category Creation Failed'
+            using
+                detail = 'Invalid Request Payload',
+                hint = _create_form_category_result.validation_failure_message;
+    end if;
+
+    return jsonb_build_object(
+        'form_category', _create_form_category_result.created_form_category
+    );
+end;
+$$;
+
+grant execute on function api.create_form_template_category(bigint, text, int) to authenticated;
+
+create or replace function api.form_template_categories(form_template_id bigint) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_user_role users.user_role := auth.current_user_role();
+    _form_categories jsonb;
+begin
+    if _current_user_role not in ('org_admin', 'org_owner') then
+        raise exception 'Form Template Categories Retrieval Failed'
+            using
+                detail = 'You are not authorized to retrieve the form template categories',
+                hint = 'unauthorized';
+    end if;
+
+    select
+        jsonb_agg(
+            jsonb_build_object(
+                'form_category_id', fc.form_category_id,
+                'form_id', fc.form_id,
+                'category_name', fc.category_name,
+                'category_position', fc.category_position,
+                'created_at', fc.created_at
+            ) order by fc.category_position
+        )
+    into
+        _form_categories
+    from
+        forms.form_category fc
+    join
+        forms.form f on fc.form_id = f.form_id
+    join
+        forms.form_template ft on f.form_id = ft.form_id
+    where
+        ft.form_template_id = $1
+    and
+        ft.organization_id = auth.current_user_organization_id();
+    
+    return coalesce(_form_categories, '[]'::jsonb);
+end;
+$$;
+
+grant execute on function api.form_template_categories(bigint) to authenticated;
+
+create or replace function forms.validate_update_form_categories_input(_form_categories jsonb[]) returns text
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _required_fields text[] := array['form_category_id', 'form_id', 'category_name', 'category_position'];
+    _distinct_form_ids bigint[];
+    _form_category jsonb;
+    _field_name text;
+    _form_id bigint;
+begin
+    if array_length(_form_categories, 1) is null then
+        return 'missing_form_categories';
+    end if;
+
+    -- Validate all form_ids are the same
+    select array_agg(distinct (c->>'form_id')::bigint)
+    into _distinct_form_ids
+    from unnest(_form_categories) as c;
+
+    -- Check if we have exactly one form_id that's not null
+    if array_length(_distinct_form_ids, 1) != 1 or _distinct_form_ids[1] is null then
+        return 'distinct_form_id_not_found';
+    end if;
+
+    _form_id := _distinct_form_ids[1];
+
+    -- Validate all required fields are present
+    foreach _form_category in array _form_categories loop
+        foreach _field_name in array _required_fields loop
+            if not _form_category ? _field_name then
+                return 'missing_' || _field_name;
+            end if;
+        end loop;
+
+        -- Validate category_position positive integer
+        if (_form_category->>'category_position')::int is null or (_form_category->>'category_position')::int < 1 then
+            return 'invalid_category_position';
+        end if;
+
+        -- Validate category_name is not empty
+        if trim(_form_category->>'category_name') = '' then
+            return 'invalid_category_name';
+        end if;
+    end loop;
+
+    -- Validate category_position is unique
+    if exists (
+        select 1
+        from unnest(_form_categories) c1
+        join unnest(_form_categories) c2 on 
+            (c1->>'category_position')::int = (c2->>'category_position')::int
+            and c1->>'form_category_id' != c2->>'form_category_id'
+    ) then
+        return 'non_unique_category_position';
+    end if;
+
+    -- Validate form_category_ids exist and belong to the correct form
+    if exists (
+        select 1
+        from unnest(_form_categories) c
+        where not exists (
+            select 1 
+            from forms.form_category fc
+            where fc.form_category_id = (c->>'form_category_id')::bigint
+            and fc.form_id = _form_id
+        )
+    ) then
+        return 'invalid_form_category_id';
+    end if;
+
+    return null;
+end;
+$$;
+
+create or replace function forms.update_form_categories(
+    form_categories jsonb[],
+    out validation_failure_message text,
+    out updated_form_categories forms.form_category[]
+) returns record
+    language plpgsql
+    security definer
+as $$
+declare
+    _form_id bigint;
+begin
+    -- Validate input
+    validation_failure_message := forms.validate_update_form_categories_input(form_categories);
+    if validation_failure_message is not null then
+        return;
+    end if;
+
+    -- Get form_id (we know it's consistent due to validation)
+    select (form_categories[1]->>'form_id')::bigint into _form_id;
+
+    -- Create temporary table for updates
+    create temp table temp_categories (
+        form_category_id bigint,
+        category_name text,
+        category_position int
+    ) on commit drop;
+
+    -- Insert validated data into temp table
+    insert into temp_categories (
+        form_category_id,
+        category_name,
+        category_position
+    )
+    select 
+        (c->>'form_category_id')::bigint,
+        c->>'category_name',
+        (c->>'category_position')::int
+    from unnest(form_categories) as c;
+
+    -- Perform updates and store results
+    with updates as (
+        update forms.form_category fc
+        set 
+            category_name = tc.category_name,
+            category_position = tc.category_position
+        from temp_categories tc
+        where fc.form_category_id = tc.form_category_id
+        and fc.form_id = _form_id
+        returning fc.*
+    )
+    select array_agg(updates.*) into updated_form_categories
+    from updates;
+
+    -- Cleanup
+    drop table if exists temp_categories;
+end;
+$$;
+
+create or replace function api.update_form_template_categories(form_categories jsonb[]) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_user_role users.user_role := auth.current_user_role();
+    _update_form_categories_result record;
+begin
+    if _current_user_role not in ('org_admin', 'org_owner') then
+        raise exception 'Form Template Categories Update Failed'
+            using
+                detail = 'You are not authorized to update the form template categories',
+                hint = 'unauthorized';
+    end if;
+
+    _update_form_categories_result := forms.update_form_categories(form_categories);
+    if _update_form_categories_result.validation_failure_message is not null then
+        raise exception 'Form Template Categories Update Failed'
+            using
+                detail = 'Invalid Request Payload',
+                hint = _update_form_categories_result.validation_failure_message;
+    end if;
+
+    return jsonb_build_object(
+        'form_categories', coalesce(
+            to_jsonb(_update_form_categories_result.updated_form_categories),
+            '[]'::jsonb
+        )
+    );
+end;
+$$;
+
+grant execute on function api.update_form_template_categories(jsonb[]) to authenticated;
 commit;
