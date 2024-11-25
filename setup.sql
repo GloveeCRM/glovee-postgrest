@@ -2541,6 +2541,7 @@ commit;
 begin;
 -- Create a schema for forms
 create schema if not exists forms;
+grant usage on schema forms to authenticated;
 
 create table if not exists forms.form (
     form_id bigint default utils.generate_random_id() not null primary key,
@@ -3054,62 +3055,88 @@ begin
 end;
 $$;
 
-create or replace function forms.update_form_categories(
-    form_categories jsonb[],
+create or replace function forms.create_form_question_set(
+    _form_section_id bigint,
+    _form_question_set_type forms.form_question_set_type,
+    _form_question_set_position int,
+    _depends_on_option_id bigint default null,
+    _parent_form_question_set_id bigint default null,
     out validation_failure_message text,
-    out updated_form_categories forms.form_category[]
+    out created_form_question_set forms.form_question_set
 ) returns record
     language plpgsql
     security definer
-as $$
+as
+$$
 declare
-    _form_id bigint;
+    r record;
 begin
-    -- Validate input
-    validation_failure_message := forms.validate_update_form_categories_input(form_categories);
+    validation_failure_message := forms.validate_create_form_question_set_input(_form_section_id, _form_question_set_type, _form_question_set_position, _depends_on_option_id, _parent_form_question_set_id);
     if validation_failure_message is not null then
         return;
     end if;
 
-    -- Get form_id (we know it's consistent due to validation)
-    select (form_categories[1]->>'form_id')::bigint into _form_id;
-
-    -- Create temporary table for updates
-    create temp table temp_categories (
-        form_category_id bigint,
-        category_name text,
-        category_position int
+    -- Create temporary table for current positions
+    create temp table temp_positions (
+        form_question_set_id bigint,
+        current_position int,
+        new_position int
     ) on commit drop;
 
-    -- Insert validated data into temp table
-    insert into temp_categories (
-        form_category_id,
-        category_name,
-        category_position
+    -- Insert current records that need position updates
+    if _parent_form_question_set_id is not null then
+        -- For nested question sets
+        insert into temp_positions (form_question_set_id, current_position, new_position)
+        select
+            form_question_set_id,
+            form_question_set_position,
+            form_question_set_position + 1
+        from forms.form_question_set
+        where parent_form_question_set_id = _parent_form_question_set_id
+        and form_question_set_position >= _form_question_set_position
+        order by form_question_set_position desc;
+    else
+        -- For root level question sets
+        insert into temp_positions (form_question_set_id, current_position, new_position)
+        select
+            form_question_set_id,
+            form_question_set_position,
+            form_question_set_position + 1
+        from forms.form_question_set
+        where form_section_id = _form_section_id
+        and parent_form_question_set_id is null
+        and form_question_set_position >= _form_question_set_position
+        order by form_question_set_position desc;
+    end if;
+
+    -- Update existing positions one by one, from highest to lowest
+    for r in (select * from temp_positions order by current_position desc) loop
+        update forms.form_question_set
+        set form_question_set_position = r.new_position
+        where form_question_set_id = r.form_question_set_id;
+    end loop;
+
+    -- Insert the new question set
+    insert into forms.form_question_set (
+        form_section_id,
+        form_question_set_type,
+        form_question_set_position,
+        depends_on_option_id,
+        parent_form_question_set_id
     )
-    select 
-        (c->>'form_category_id')::bigint,
-        c->>'category_name',
-        (c->>'category_position')::int
-    from unnest(form_categories) as c;
-
-    -- Perform updates and store results
-    update forms.form_category fc
-    set 
-        category_name = tc.category_name,
-        category_position = tc.category_position
-    from temp_categories tc
-    where fc.form_category_id = tc.form_category_id
-    and fc.form_id = _form_id;
-
-    -- Return ALL categories for the form, not just updated ones
-    select array_agg(fc.* order by fc.category_position)
-    into updated_form_categories
-    from forms.form_category fc
-    where fc.form_id = _form_id;
+    values (
+        _form_section_id,
+        _form_question_set_type,
+        _form_question_set_position,
+        _depends_on_option_id,
+        _parent_form_question_set_id
+    )
+    returning * into created_form_question_set;
 
     -- Cleanup
-    drop table if exists temp_categories;
+    drop table if exists temp_positions;
+
+    return;
 end;
 $$;
 
@@ -3620,5 +3647,264 @@ end;
 $$;
 
 grant execute on function api.delete_form_template_section(bigint) to authenticated;
+
+-- Form Question Set
+do $$ 
+begin
+    if not exists (select 1 from pg_type where typname = 'form_question_set_type') then
+        create domain forms.form_question_set_type as text
+        check (
+            value in ('static', 'repeatable', 'conditional')
+        );
+    end if;
+end $$;
+
+create table if not exists forms.form_question_set (
+    form_question_set_id bigint default utils.generate_random_id() not null primary key,
+    form_section_id bigint references forms.form_section(form_section_id) on delete cascade,
+    form_question_set_type forms.form_question_set_type not null,
+    form_question_set_position int not null check (form_question_set_position > 0),
+    depends_on_option_id bigint,
+    parent_form_question_set_id bigint references forms.form_question_set(form_question_set_id) on delete cascade,
+    created_at timestamp with time zone default now() not null,
+    unique (parent_form_question_set_id, form_question_set_position)
+);
+
+-- Create a partial unique index for root-level question sets
+create unique index form_question_set_section_position_unique 
+on forms.form_question_set (form_section_id, form_question_set_position)
+where parent_form_question_set_id is null;
+
+create or replace function forms.form_id_by_form_section_id(_form_section_id bigint) returns bigint
+    language sql
+    stable
+as
+$$
+    select fc.form_id 
+    from forms.form_section fs
+    join forms.form_category fc on fs.form_category_id = fc.form_category_id
+    where fs.form_section_id = _form_section_id;
+$$;
+
+create or replace function forms.validate_create_form_question_set_input(
+    _form_section_id bigint,
+    _form_question_set_type forms.form_question_set_type,
+    _form_question_set_position int,
+    _depends_on_option_id bigint default null,
+    _parent_form_question_set_id bigint default null
+) returns text
+    language plpgsql
+    security definer
+as
+$$
+begin
+    if _form_section_id is null or _form_section_id <= 0 then
+        return 'missing_form_section_id';
+    end if;
+
+    if _form_question_set_type is null then
+        return 'missing_form_question_set_type';
+    end if;
+
+    if _form_question_set_position is null or _form_question_set_position < 1 then
+        return 'missing_form_question_set_position';
+    end if;
+
+    if _depends_on_option_id is not null then
+        return null;
+    end if;
+
+    if _parent_form_question_set_id is not null then
+        if not exists (
+            select 1
+            from forms.form_question_set fqs
+            where fqs.form_question_set_id = _parent_form_question_set_id
+        ) then
+            return 'parent_form_question_set_not_found';
+        end if;
+    end if;
+
+    return null;
+end;
+$$;
+
+create or replace function forms.create_form_question_set(
+    _form_section_id bigint,
+    _form_question_set_type forms.form_question_set_type,
+    _form_question_set_position int,
+    _depends_on_option_id bigint default null,
+    _parent_form_question_set_id bigint default null,
+    out validation_failure_message text,
+    out updated_form_question_sets forms.form_question_set[]
+) returns record
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _r record;
+    _form_id bigint := forms.form_id_by_form_section_id(_form_section_id);
+begin
+    validation_failure_message := forms.validate_create_form_question_set_input(_form_section_id, _form_question_set_type, _form_question_set_position, _depends_on_option_id, _parent_form_question_set_id);
+    if validation_failure_message is not null then
+        return;
+    end if;
+
+    -- Create temporary table for current positions
+    create temp table temp_positions (
+        form_question_set_id bigint,
+        current_position int,
+        new_position int
+    ) on commit drop;
+
+    -- Insert current records that need position updates
+    if _parent_form_question_set_id is not null then
+        -- For nested question sets
+        insert into temp_positions (form_question_set_id, current_position, new_position)
+        select 
+            form_question_set_id,
+            form_question_set_position,
+            form_question_set_position + 1
+        from forms.form_question_set
+        where parent_form_question_set_id = _parent_form_question_set_id
+        and form_question_set_position >= _form_question_set_position
+        order by form_question_set_position desc;
+    else
+        -- For root level question sets
+        insert into temp_positions (form_question_set_id, current_position, new_position)
+        select 
+            form_question_set_id,
+            form_question_set_position,
+            form_question_set_position + 1
+        from forms.form_question_set
+        where form_section_id = _form_section_id
+        and parent_form_question_set_id is null
+        and form_question_set_position >= _form_question_set_position
+        order by form_question_set_position desc;
+    end if;
+
+    -- Update existing positions one by one, from highest to lowest
+    for _r in (select * from temp_positions order by current_position desc) loop
+        update forms.form_question_set
+        set form_question_set_position = _r.new_position
+        where form_question_set_id = _r.form_question_set_id;
+    end loop;
+
+    -- Insert the new question set
+    insert into forms.form_question_set (
+        form_section_id, 
+        form_question_set_type, 
+        form_question_set_position, 
+        depends_on_option_id, 
+        parent_form_question_set_id
+    )
+    values (
+        _form_section_id, 
+        _form_question_set_type, 
+        _form_question_set_position, 
+        _depends_on_option_id, 
+        _parent_form_question_set_id
+    );
+
+    -- Return all question sets for the form
+    select 
+        array_agg(
+                fqs 
+            order by 
+                fc.category_position,
+                fs.section_position,
+                fqs.form_question_set_position
+        ) into updated_form_question_sets
+    from forms.form_question_set fqs
+    join forms.form_section fs on fqs.form_section_id = fs.form_section_id
+    join forms.form_category fc on fs.form_category_id = fc.form_category_id
+    where fc.form_id = _form_id;
+
+    -- Cleanup
+    drop table if exists temp_positions;
+
+    return;
+end;
+$$;
+
+create or replace function api.create_form_template_question_set(
+    form_section_id bigint,
+    form_question_set_type forms.form_question_set_type,
+    form_question_set_position int,
+    depends_on_option_id bigint default null,
+    parent_form_question_set_id bigint default null
+) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_user_role users.user_role := auth.current_user_role();
+    _create_form_question_set_result record;
+begin
+    if _current_user_role not in ('org_admin', 'org_owner') then
+        raise exception 'Form Template Question Set Creation Failed'
+            using
+                detail = 'You are not authorized to create a form template question set',
+                hint = 'unauthorized';
+    end if;
+
+    _create_form_question_set_result := forms.create_form_question_set(form_section_id, form_question_set_type, form_question_set_position, depends_on_option_id, parent_form_question_set_id);
+    if _create_form_question_set_result.validation_failure_message is not null then
+        raise exception 'Form Template Question Set Creation Failed'
+            using
+                detail = 'Invalid Request Payload',
+                hint = _create_form_question_set_result.validation_failure_message;
+    end if;
+
+    return jsonb_build_object(
+        'form_question_sets', _create_form_question_set_result.updated_form_question_sets
+    );
+end;
+$$;
+
+grant execute on function api.create_form_template_question_set(bigint, forms.form_question_set_type, int, bigint, bigint) to authenticated;
+
+create or replace function api.form_template_question_sets(form_template_id bigint) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_user_role users.user_role := auth.current_user_role();
+    _target_org_id bigint := auth.current_user_organization_id();
+    _form_question_sets jsonb;
+begin
+    if _current_user_role not in ('org_admin', 'org_owner') then
+        raise exception 'Form Template Question Sets Retrieval Failed'
+            using
+                detail = 'You are not authorized to retrieve the form template question sets',
+                hint = 'unauthorized';
+    end if;
+
+    select
+        jsonb_agg(fqs)
+    into
+        _form_question_sets
+    from 
+        forms.form_question_set fqs
+    join 
+        forms.form_section fs on fqs.form_section_id = fs.form_section_id
+    join 
+        forms.form_category fc on fs.form_category_id = fc.form_category_id
+    join 
+        forms.form f on fc.form_id = f.form_id
+    join 
+        forms.form_template ft on f.form_id = ft.form_id
+    where 
+        ft.form_template_id = $1 
+    and 
+        ft.organization_id = _target_org_id;
+
+    return coalesce(_form_question_sets, '[]'::jsonb);
+end;
+$$;
+
+grant execute on function api.form_template_question_sets(bigint) to authenticated;
 
 commit;
