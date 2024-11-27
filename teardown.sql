@@ -26,6 +26,10 @@ end$$;
 begin;
 
 -- Drop Forms
+drop function if exists api.delete_form_template_question_set(bigint);
+drop function if exists forms.form_question_set_position_by_form_question_set_id(bigint);
+drop function if exists forms.parent_form_question_set_id_by_form_question_set_id(bigint);
+drop function if exists forms.form_section_id_by_form_question_set_id(bigint);
 drop function if exists api.form_template_question_sets(bigint);
 drop function if exists api.create_form_template_question_set(bigint, forms.form_question_set_type, int, bigint, bigint);
 drop function if exists forms.create_form_question_set(bigint, forms.form_question_set_type, int, bigint, bigint);

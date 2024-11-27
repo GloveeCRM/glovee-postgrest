@@ -3907,4 +3907,122 @@ $$;
 
 grant execute on function api.form_template_question_sets(bigint) to authenticated;
 
+create or replace function forms.form_section_id_by_form_question_set_id(_form_question_set_id bigint) returns bigint
+    language sql
+    stable
+as
+$$
+    select
+        form_section_id
+    from
+        forms.form_question_set
+    where
+        form_question_set_id = _form_question_set_id;
+$$;
+
+create or replace function forms.parent_form_question_set_id_by_form_question_set_id(_form_question_set_id bigint) returns bigint
+    language sql
+    stable
+as
+$$
+    select 
+        parent_form_question_set_id
+    from 
+        forms.form_question_set
+    where 
+        form_question_set_id = _form_question_set_id;
+$$;
+
+create or replace function forms.form_question_set_position_by_form_question_set_id(_form_question_set_id bigint) returns int
+    language sql
+    stable
+as
+$$
+    select
+        form_question_set_position
+    from
+        forms.form_question_set
+    where
+        form_question_set_id = _form_question_set_id;
+$$;
+
+create or replace function api.delete_form_template_question_set(form_question_set_id bigint) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_user_role users.user_role := auth.current_user_role();
+    _target_org_id bigint := auth.current_user_organization_id();
+    _target_form_question_set_position int := forms.form_question_set_position_by_form_question_set_id(form_question_set_id);
+    _parent_form_question_set_id bigint := forms.parent_form_question_set_id_by_form_question_set_id(form_question_set_id);
+    _target_form_section_id bigint := forms.form_section_id_by_form_question_set_id(form_question_set_id);
+    _target_form_category_id bigint := forms.form_category_id_by_form_section_id(_target_form_section_id);
+    _target_form_id bigint := forms.form_id_by_form_category_id(_target_form_category_id);
+    _remaining_form_question_sets jsonb;
+begin
+    if _current_user_role not in ('org_admin', 'org_owner') then
+        raise exception 'Form Template Question Set Deletion Failed'
+            using
+                detail = 'You are not authorized to delete this form template question set',
+                hint = 'unauthorized';
+    end if;
+
+    delete from forms.form_question_set fqs
+    using forms.form_section fs,
+          forms.form_category fc,
+          forms.form f,
+          forms.form_template ft
+    where fqs.form_question_set_id = $1
+    and fs.form_section_id = fqs.form_section_id
+    and fc.form_category_id = fs.form_category_id
+    and f.form_id = fc.form_id
+    and ft.form_id = f.form_id
+    and ft.organization_id = _target_org_id;
+
+    if not found then
+        raise exception 'Form Template Question Set Deletion Failed'
+            using
+                detail = 'Form Template Question Set not found',
+                hint = 'form_question_set_not_found';
+    end if;
+
+    -- Reorder the question sets
+    if _parent_form_question_set_id is not null then
+        -- For nested question sets, update positions within the parent
+        update forms.form_question_set
+        set form_question_set_position = form_question_set_position - 1
+        where parent_form_question_set_id = _parent_form_question_set_id
+        and form_question_set_position > _target_form_question_set_position;
+    else
+        -- For root level question sets, update positions within the section
+        update forms.form_question_set
+        set form_question_set_position = form_question_set_position - 1
+        where form_section_id = _target_form_section_id
+        and parent_form_question_set_id is null
+        and form_question_set_position > _target_form_question_set_position;
+    end if;
+
+    -- Return remaining form question sets
+    select json_agg(
+        fqs 
+        order by 
+            fc.category_position, 
+            fs.section_position, 
+            fqs.form_question_set_position
+    ) into _remaining_form_question_sets
+    from forms.form_question_set fqs
+    join forms.form_section fs on fqs.form_section_id = fs.form_section_id
+    join forms.form_category fc on fs.form_category_id = fc.form_category_id
+    where fc.form_id = _target_form_id;
+
+    return jsonb_build_object(
+        'form_question_sets', 
+        _remaining_form_question_sets
+    );
+end;
+$$;
+
+grant execute on function api.delete_form_template_question_set(bigint) to authenticated;
+
 commit;
