@@ -26,6 +26,12 @@ end$$;
 begin;
 
 -- Drop Forms
+drop function if exists api.create_form_template_question;
+drop function if exists forms.form_id_by_form_question_set_id;
+drop function if exists forms.create_form_question_settings;
+drop function if exists forms.validate_create_form_question_settings_input;
+drop function if exists forms.create_form_question;
+drop function if exists forms.validate_create_form_question_input;
 drop function if exists api.delete_form_template_question_set(bigint);
 drop function if exists forms.form_question_set_position_by_form_question_set_id(bigint);
 drop function if exists forms.parent_form_question_set_id_by_form_question_set_id(bigint);
@@ -35,6 +41,9 @@ drop function if exists api.create_form_template_question_set(bigint, forms.form
 drop function if exists forms.create_form_question_set(bigint, forms.form_question_set_type, int, bigint, bigint);
 drop function if exists forms.form_id_by_form_section_id(bigint);
 drop function if exists forms.validate_create_form_question_set_input(bigint, forms.form_question_set_type, int, bigint, bigint);
+drop table if exists forms.form_question_settings;
+drop table if exists forms.form_question;
+drop domain if exists forms.form_question_type;
 drop index if exists forms.form_question_set_section_position_unique;
 drop table if exists forms.form_question_set cascade;
 drop domain if exists forms.form_question_set_type;

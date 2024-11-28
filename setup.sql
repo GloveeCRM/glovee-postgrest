@@ -2259,7 +2259,7 @@ declare
     _application_files jsonb;
 begin
     if (_current_user_role = 'org_client' and applications.application_user_id($1) != _current_user_id)
-    or (_current_user_role in ('org_admin', 'org_owner') and applications.application_organization_id($1) != _current_user_org_id) then
+    or (_current_user_role in ('org_admin', 'org_owner') and applications.application_organization_id($1) != _current_user_org_id then
         raise exception 'Application Files Retrieval Failed'
             using
                 detail = 'You are not authorized to retrieve the application files for this application',
@@ -3055,91 +3055,6 @@ begin
 end;
 $$;
 
-create or replace function forms.create_form_question_set(
-    _form_section_id bigint,
-    _form_question_set_type forms.form_question_set_type,
-    _form_question_set_position int,
-    _depends_on_option_id bigint default null,
-    _parent_form_question_set_id bigint default null,
-    out validation_failure_message text,
-    out created_form_question_set forms.form_question_set
-) returns record
-    language plpgsql
-    security definer
-as
-$$
-declare
-    r record;
-begin
-    validation_failure_message := forms.validate_create_form_question_set_input(_form_section_id, _form_question_set_type, _form_question_set_position, _depends_on_option_id, _parent_form_question_set_id);
-    if validation_failure_message is not null then
-        return;
-    end if;
-
-    -- Create temporary table for current positions
-    create temp table temp_positions (
-        form_question_set_id bigint,
-        current_position int,
-        new_position int
-    ) on commit drop;
-
-    -- Insert current records that need position updates
-    if _parent_form_question_set_id is not null then
-        -- For nested question sets
-        insert into temp_positions (form_question_set_id, current_position, new_position)
-        select
-            form_question_set_id,
-            form_question_set_position,
-            form_question_set_position + 1
-        from forms.form_question_set
-        where parent_form_question_set_id = _parent_form_question_set_id
-        and form_question_set_position >= _form_question_set_position
-        order by form_question_set_position desc;
-    else
-        -- For root level question sets
-        insert into temp_positions (form_question_set_id, current_position, new_position)
-        select
-            form_question_set_id,
-            form_question_set_position,
-            form_question_set_position + 1
-        from forms.form_question_set
-        where form_section_id = _form_section_id
-        and parent_form_question_set_id is null
-        and form_question_set_position >= _form_question_set_position
-        order by form_question_set_position desc;
-    end if;
-
-    -- Update existing positions one by one, from highest to lowest
-    for r in (select * from temp_positions order by current_position desc) loop
-        update forms.form_question_set
-        set form_question_set_position = r.new_position
-        where form_question_set_id = r.form_question_set_id;
-    end loop;
-
-    -- Insert the new question set
-    insert into forms.form_question_set (
-        form_section_id,
-        form_question_set_type,
-        form_question_set_position,
-        depends_on_option_id,
-        parent_form_question_set_id
-    )
-    values (
-        _form_section_id,
-        _form_question_set_type,
-        _form_question_set_position,
-        _depends_on_option_id,
-        _parent_form_question_set_id
-    )
-    returning * into created_form_question_set;
-
-    -- Cleanup
-    drop table if exists temp_positions;
-
-    return;
-end;
-$$;
-
 create or replace function api.update_form_template_categories(form_categories jsonb[]) returns jsonb
     language plpgsql
     security definer
@@ -3675,6 +3590,35 @@ create unique index form_question_set_section_position_unique
 on forms.form_question_set (form_section_id, form_question_set_position)
 where parent_form_question_set_id is null;
 
+do $$
+begin
+    if not exists (select 1 from pg_type where typname = 'form_question_type') then
+        create domain forms.form_question_type as text
+        check (
+            value in ('text', 'textarea', 'select', 'date', 'radio', 'checkbox', 'file')
+        );
+    end if;
+end $$;
+
+create table if not exists forms.form_question (
+    form_question_id bigint default utils.generate_random_id() not null primary key,
+    form_question_set_id bigint references forms.form_question_set(form_question_set_id) on delete cascade,
+    question_prompt text not null,
+    question_type forms.form_question_type not null,
+    question_position int not null check (question_position > 0),
+    created_at timestamp with time zone default now() not null,
+    unique (form_question_set_id, question_position)
+);
+
+create table if not exists forms.form_question_settings (
+    form_question_settings_id bigint default utils.generate_random_id() not null primary key,
+    form_question_id bigint references forms.form_question(form_question_id) on delete cascade,
+    helper_text text,
+    is_required boolean default false not null,
+    created_at timestamp with time zone default now() not null,
+    unique (form_question_id)
+);
+
 create or replace function forms.form_id_by_form_section_id(_form_section_id bigint) returns bigint
     language sql
     stable
@@ -3684,6 +3628,164 @@ $$
     from forms.form_section fs
     join forms.form_category fc on fs.form_category_id = fc.form_category_id
     where fs.form_section_id = _form_section_id;
+$$;
+
+create or replace function forms.validate_create_form_question_input(
+    _form_question_set_id bigint,
+    _question_prompt text,
+    _question_type forms.form_question_type,
+    _question_position int
+) returns text
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _target_org_id bigint := auth.current_user_organization_id();
+begin
+    if _form_question_set_id is null or _form_question_set_id <= 0 then
+        return 'missing_form_question_set_id';
+    end if;
+
+    if _question_prompt is null or _question_prompt = '' then
+        return 'missing_question_prompt';
+    end if;
+
+    if _question_type is null then
+        return 'missing_question_type';
+    end if;
+
+    if _question_position is null or _question_position < 1 then
+        return 'missing_question_position';
+    end if;
+
+    if not exists (
+        select 1
+        from forms.form_question_set fqs
+        join forms.form_section fs on fqs.form_section_id = fs.form_section_id
+        join forms.form_category fc on fs.form_category_id = fc.form_category_id
+        where fqs.form_question_set_id = _form_question_set_id
+        and forms.form_organization_id(fc.form_id) = _target_org_id
+    ) then
+        return 'form_question_set_not_found';
+    end if;
+
+    return null;
+end;
+$$;
+
+create or replace function forms.create_form_question(
+    _form_question_set_id bigint,
+    _question_prompt text,
+    _question_type forms.form_question_type,
+    _question_position int,
+    out validation_failure_message text,
+    out created_form_question forms.form_question
+) returns record
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _r record;
+begin
+    validation_failure_message := forms.validate_create_form_question_input(_form_question_set_id, _question_prompt, _question_type, _question_position);
+    if validation_failure_message is not null then
+        return;
+    end if;
+
+    -- Create temporary table for current positions
+    create temp table temp_positions (
+        form_question_id bigint,
+        current_position int,
+        new_position int
+    ) on commit drop;
+
+    -- Insert current records that need position updates
+    insert into temp_positions (form_question_id, current_position, new_position)
+    select
+        form_question_id,
+        question_position,
+        question_position + 1
+    from forms.form_question
+    where form_question_set_id = _form_question_set_id
+    and question_position >= _question_position
+    order by question_position desc;
+
+    -- Update existing positions one by one, from highest to lowest
+    for _r in (select * from temp_positions order by current_position desc) loop
+        update forms.form_question
+        set question_position = _r.new_position
+        where form_question_id = _r.form_question_id;
+    end loop;
+
+    -- Insert the new question
+    insert into forms.form_question (
+        form_question_set_id,
+        question_prompt,
+        question_type,
+        question_position
+    ) values (
+        _form_question_set_id,
+        _question_prompt,
+        _question_type,
+        _question_position
+    ) returning * into created_form_question;
+
+    -- Cleanup
+    drop table if exists temp_positions;
+
+    return;
+end;
+$$;
+
+create or replace function forms.validate_create_form_question_settings_input(
+    _form_question_id bigint,
+    _helper_text text default null,
+    _is_required boolean default false
+) returns text
+    language plpgsql
+    security definer
+as
+$$
+begin
+    if _form_question_id is null or _form_question_id <= 0 then
+        return 'missing_form_question_id';
+    end if;
+
+    return null;
+end;
+$$;
+
+create or replace function forms.create_form_question_settings(
+    _form_question_id bigint,
+    _helper_text text default null,
+    _is_required boolean default false,
+    out validation_failure_message text,
+    out created_form_question_settings forms.form_question_settings
+) returns record
+    language plpgsql
+    security definer
+as
+$$
+begin
+    validation_failure_message := forms.validate_create_form_question_settings_input(_form_question_id, _helper_text, _is_required);
+    if validation_failure_message is not null then
+        return;
+    end if;
+
+    insert into forms.form_question_settings (
+        form_question_id,
+        helper_text,
+        is_required
+    ) values (
+        _form_question_id, 
+        _helper_text, 
+        _is_required
+    ) returning * into created_form_question_settings;
+
+    return;
+end;
 $$;
 
 create or replace function forms.validate_create_form_question_set_input(
@@ -3761,7 +3863,7 @@ begin
     if _parent_form_question_set_id is not null then
         -- For nested question sets
         insert into temp_positions (form_question_set_id, current_position, new_position)
-        select 
+        select
             form_question_set_id,
             form_question_set_position,
             form_question_set_position + 1
@@ -3772,7 +3874,7 @@ begin
     else
         -- For root level question sets
         insert into temp_positions (form_question_set_id, current_position, new_position)
-        select 
+        select
             form_question_set_id,
             form_question_set_position,
             form_question_set_position + 1
@@ -4024,5 +4126,78 @@ end;
 $$;
 
 grant execute on function api.delete_form_template_question_set(bigint) to authenticated;
+
+create or replace function forms.form_id_by_form_question_set_id(_form_question_set_id bigint) returns bigint
+    language sql
+    stable
+as
+$$
+    select fc.form_id
+    from forms.form_question_set fqs
+    join forms.form_section fs on fqs.form_section_id = fs.form_section_id
+    join forms.form_category fc on fs.form_category_id = fc.form_category_id
+    where fqs.form_question_set_id = _form_question_set_id;
+$$;
+
+create or replace function api.create_form_template_question(
+    form_question_set_id bigint,
+    form_question_prompt text,
+    form_question_type forms.form_question_type,
+    form_question_position int,
+    form_question_settings jsonb default null
+) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_user_role users.user_role := auth.current_user_role();
+    _target_form_id bigint := forms.form_id_by_form_question_set_id(form_question_set_id);
+    _create_form_question_result record;
+    _create_form_question_settings_result record;
+    _updated_form_questions jsonb;
+begin
+    if _current_user_role not in ('org_admin', 'org_owner') then
+        raise exception 'Form Template Question Creation Failed'
+            using
+                detail = 'You are not authorized to create a form template question',
+                hint = 'unauthorized';
+    end if;
+
+    _create_form_question_result := forms.create_form_question(form_question_set_id, form_question_prompt, form_question_type, form_question_position);
+    if _create_form_question_result.validation_failure_message is not null then
+        raise exception 'Form Template Question Creation Failed'
+            using
+                detail = 'Invalid Request Payload',
+                hint = _create_form_question_result.validation_failure_message;
+    end if;
+
+    _create_form_question_settings_result := forms.create_form_question_settings(
+        (_create_form_question_result.created_form_question).form_question_id,
+        coalesce(form_question_settings->>'helper_text', null),
+        coalesce((form_question_settings->>'is_required')::boolean, false)
+    );
+
+    -- Return all of the form's questions including settings
+    select 
+        jsonb_agg(
+            to_jsonb(fq) || jsonb_build_object(
+                'form_question_settings', to_jsonb(fqsettings)
+            )
+        ) into _updated_form_questions
+    from forms.form_question fq
+    join forms.form_question_settings fqsettings on fq.form_question_id = fqsettings.form_question_id
+    join forms.form_question_set fqs on fq.form_question_set_id = fqs.form_question_set_id
+    join forms.form_section fs on fqs.form_section_id = fs.form_section_id
+    join forms.form_category fc on fs.form_category_id = fc.form_category_id
+    where fc.form_id = _target_form_id;
+
+    return jsonb_build_object(
+        'form_questions', _updated_form_questions
+    );
+end;
+$$;
+
+grant execute on function api.create_form_template_question(bigint, text, forms.form_question_type, int, jsonb) to authenticated;
 
 commit;
