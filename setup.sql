@@ -3879,44 +3879,6 @@ $$;
 
 grant execute on function api.create_form_template_question_set(bigint, forms.form_question_set_type, int, bigint, bigint) to authenticated;
 
-create or replace function api.form_template_section_question_sets(form_section_id bigint) returns jsonb
-    language plpgsql
-    security definer
-as
-$$
-declare
-    _current_user_role users.user_role := auth.current_user_role();
-    _target_org_id bigint := auth.current_user_organization_id();
-    _target_form_id bigint := forms.form_id_by_form_section_id(form_section_id);
-    _form_organization_id bigint := forms.form_organization_id(_target_form_id);
-    _form_question_sets jsonb;
-begin
-    if _current_user_role not in ('org_admin', 'org_owner') then
-        raise exception 'Form Template Section Question Sets Retrieval Failed'
-            using
-                detail = 'You are not authorized to retrieve the form template section question sets',
-                hint = 'unauthorized';
-    end if;
-
-    select
-        jsonb_agg(fqs)
-    into
-        _form_question_sets
-    from 
-        forms.form_question_set fqs
-    join 
-        forms.form_section fs on fqs.form_section_id = fs.form_section_id
-    where 
-        fs.form_section_id = $1
-    and 
-        _form_organization_id = _target_org_id;
-
-    return coalesce(_form_question_sets, '[]'::jsonb);
-end;
-$$;
-
-grant execute on function api.form_template_section_question_sets(bigint) to authenticated;
-
 create or replace function forms.form_section_id_by_form_question_set_id(_form_question_set_id bigint) returns bigint
     language sql
     stable
@@ -4051,10 +4013,10 @@ as
 $$
 declare
     _current_user_role users.user_role := auth.current_user_role();
-    _target_form_id bigint := forms.form_id_by_form_question_set_id(form_question_set_id);
+    _target_form_section_id bigint := forms.form_section_id_by_form_question_set_id(form_question_set_id);
     _create_form_question_result record;
     _create_form_question_settings_result record;
-    _updated_form_questions jsonb;
+    _updated_form_section_questions jsonb;
 begin
     if _current_user_role not in ('org_admin', 'org_owner') then
         raise exception 'Form Template Question Creation Failed'
@@ -4077,22 +4039,21 @@ begin
         coalesce((form_question_settings->>'is_required')::boolean, false)
     );
 
-    -- Return all of the form's questions including settings
+    -- Return all the form section's questions including settings
     select 
         jsonb_agg(
             to_jsonb(fq) || jsonb_build_object(
                 'form_question_settings', to_jsonb(fqsettings)
             )
-        ) into _updated_form_questions
+        ) into _updated_form_section_questions
     from forms.form_question fq
     join forms.form_question_settings fqsettings on fq.form_question_id = fqsettings.form_question_id
     join forms.form_question_set fqs on fq.form_question_set_id = fqs.form_question_set_id
     join forms.form_section fs on fqs.form_section_id = fs.form_section_id
-    join forms.form_category fc on fs.form_category_id = fc.form_category_id
-    where fc.form_id = _target_form_id;
+    where fs.form_section_id = _target_form_section_id;
 
     return jsonb_build_object(
-        'form_questions', _updated_form_questions
+        'form_questions', _updated_form_section_questions
     );
 end;
 $$;
@@ -4147,5 +4108,54 @@ end;
 $$;
 
 grant execute on function api.form_template_with_categories_and_sections(bigint) to authenticated;
+
+create or replace function api.form_template_section_question_sets_and_questions(form_section_id bigint) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_user_role users.user_role := auth.current_user_role();
+    _target_org_id bigint := auth.current_user_organization_id();
+    _target_form_id bigint := forms.form_id_by_form_section_id(form_section_id);
+    _target_form_organization_id bigint := forms.form_organization_id(_target_form_id);
+    _form_section_question_sets jsonb;
+    _form_section_questions jsonb;
+begin
+    if _current_user_role not in ('org_admin', 'org_owner') then
+        raise exception 'Form Template Section Question Sets And Questions Retrieval Failed'
+            using
+                detail = 'You are not authorized to retrieve the form template section question sets and questions',
+                hint = 'unauthorized';
+    end if;
+
+    select jsonb_agg(fqs)
+    into _form_section_question_sets
+    from forms.form_question_set fqs
+    join forms.form_section fs on fqs.form_section_id = fs.form_section_id
+    where fs.form_section_id = $1
+    and _target_form_organization_id = _target_org_id;
+
+    select jsonb_agg(
+        to_jsonb(fq) || jsonb_build_object(
+            'question_settings', to_jsonb(fqsettings)
+        )
+    )
+    into _form_section_questions
+    from forms.form_question fq
+    join forms.form_question_settings fqsettings on fq.form_question_id = fqsettings.form_question_id
+    join forms.form_question_set fqs on fq.form_question_set_id = fqs.form_question_set_id
+    join forms.form_section fs on fqs.form_section_id = fs.form_section_id
+    where fs.form_section_id = $1
+    and _target_form_organization_id = _target_org_id;
+
+    return jsonb_build_object(
+        'form_question_sets', _form_section_question_sets,
+        'form_questions', _form_section_questions
+    );
+end;
+$$;
+
+grant execute on function api.form_template_section_question_sets_and_questions(bigint) to authenticated;
 
 commit;
