@@ -3518,11 +3518,11 @@ end $$;
 create table if not exists forms.form_question (
     form_question_id bigint default utils.generate_random_id() not null primary key,
     form_question_set_id bigint references forms.form_question_set(form_question_set_id) on delete cascade,
-    question_prompt text not null,
-    question_type forms.form_question_type not null,
-    question_position int not null check (question_position > 0),
+    form_question_prompt text not null,
+    form_question_type forms.form_question_type not null,
+    form_question_position int not null check (form_question_position > 0),
     created_at timestamp with time zone default now() not null,
-    unique (form_question_set_id, question_position)
+    unique (form_question_set_id, form_question_position)
 );
 
 create table if not exists forms.form_question_settings (
@@ -3547,9 +3547,9 @@ $$;
 
 create or replace function forms.validate_create_form_question_input(
     _form_question_set_id bigint,
-    _question_prompt text,
-    _question_type forms.form_question_type,
-    _question_position int
+    _form_question_prompt text,
+    _form_question_type forms.form_question_type,
+    _form_question_position int
 ) returns text
     language plpgsql
     security definer
@@ -3562,16 +3562,16 @@ begin
         return 'missing_form_question_set_id';
     end if;
 
-    if _question_prompt is null or _question_prompt = '' then
-        return 'missing_question_prompt';
+    if _form_question_prompt is null or _form_question_prompt = '' then
+        return 'missing_form_question_prompt';
     end if;
 
-    if _question_type is null then
-        return 'missing_question_type';
+    if _form_question_type is null then
+        return 'missing_form_question_type';
     end if;
 
-    if _question_position is null or _question_position < 1 then
-        return 'missing_question_position';
+    if _form_question_position is null or _form_question_position < 1 then
+        return 'missing_form_question_position';
     end if;
 
     if not exists (
@@ -3591,9 +3591,9 @@ $$;
 
 create or replace function forms.create_form_question(
     _form_question_set_id bigint,
-    _question_prompt text,
-    _question_type forms.form_question_type,
-    _question_position int,
+    _form_question_prompt text,
+    _form_question_type forms.form_question_type,
+    _form_question_position int,
     out validation_failure_message text,
     out created_form_question forms.form_question
 ) returns record
@@ -3604,7 +3604,7 @@ $$
 declare
     _r record;
 begin
-    validation_failure_message := forms.validate_create_form_question_input(_form_question_set_id, _question_prompt, _question_type, _question_position);
+    validation_failure_message := forms.validate_create_form_question_input(_form_question_set_id, _form_question_prompt, _form_question_type, _form_question_position);
     if validation_failure_message is not null then
         return;
     end if;
@@ -3620,31 +3620,31 @@ begin
     insert into temp_positions (form_question_id, current_position, new_position)
     select
         form_question_id,
-        question_position,
-        question_position + 1
+        form_question_position,
+        form_question_position + 1
     from forms.form_question
     where form_question_set_id = _form_question_set_id
-    and question_position >= _question_position
-    order by question_position desc;
+    and form_question_position >= _form_question_position
+    order by form_question_position desc;
 
     -- Update existing positions one by one, from highest to lowest
     for _r in (select * from temp_positions order by current_position desc) loop
         update forms.form_question
-        set question_position = _r.new_position
+        set form_question_position = _r.new_position
         where form_question_id = _r.form_question_id;
     end loop;
 
     -- Insert the new question
     insert into forms.form_question (
         form_question_set_id,
-        question_prompt,
-        question_type,
-        question_position
+        form_question_prompt,
+        form_question_type,
+        form_question_position
     ) values (
         _form_question_set_id,
-        _question_prompt,
-        _question_type,
-        _question_position
+        _form_question_prompt,
+        _form_question_type,
+        _form_question_position
     ) returning * into created_form_question;
 
     -- Cleanup
@@ -4045,6 +4045,7 @@ begin
             to_jsonb(fq) || jsonb_build_object(
                 'form_question_settings', to_jsonb(fqsettings)
             )
+            order by fq.form_question_position
         ) into _updated_form_section_questions
     from forms.form_question fq
     join forms.form_question_settings fqsettings on fq.form_question_id = fqsettings.form_question_id
@@ -4129,7 +4130,7 @@ begin
                 hint = 'unauthorized';
     end if;
 
-    select jsonb_agg(fqs)
+    select jsonb_agg(fqs order by fqs.form_question_set_position)
     into _form_section_question_sets
     from forms.form_question_set fqs
     join forms.form_section fs on fqs.form_section_id = fs.form_section_id
@@ -4140,6 +4141,7 @@ begin
         to_jsonb(fq) || jsonb_build_object(
             'question_settings', to_jsonb(fqsettings)
         )
+        order by fq.form_question_position
     )
     into _form_section_questions
     from forms.form_question fq
