@@ -3532,9 +3532,24 @@ create table if not exists forms.form_question_settings (
     form_question_id bigint references forms.form_question(form_question_id) on delete cascade,
     helper_text text,
     is_required boolean default false not null,
+    placeholder_text text,
+    minimum_length int,
+    maximum_length int,
+    minimum_date date,
+    maximum_date date,
     created_at timestamp with time zone default now() not null,
     unique (form_question_id)
 );
+
+create or replace function forms.form_question_settings(_form_question_id bigint) returns forms.form_question_settings
+    language sql
+    stable
+as
+$$
+    select *
+    from forms.form_question_settings
+    where form_question_id = _form_question_id;
+$$;
 
 create or replace function forms.form_id_by_form_section_id(_form_section_id bigint) returns bigint
     language sql
@@ -3657,17 +3672,22 @@ end;
 $$;
 
 create or replace function forms.validate_create_form_question_settings_input(
-    _form_question_id bigint,
-    _helper_text text default null,
-    _is_required boolean default false
+    _form_question_settings jsonb
 ) returns text
     language plpgsql
     security definer
 as
 $$
+declare
+    _form_question_id bigint := (_form_question_settings->>'form_question_id')::bigint;
+    _is_required boolean := (_form_question_settings->>'is_required')::boolean;
 begin
     if _form_question_id is null or _form_question_id <= 0 then
         return 'missing_form_question_id';
+    end if;
+
+    if _is_required is null then
+        return 'missing_is_required';
     end if;
 
     return null;
@@ -3675,9 +3695,7 @@ end;
 $$;
 
 create or replace function forms.create_form_question_settings(
-    _form_question_id bigint,
-    _helper_text text default null,
-    _is_required boolean default false,
+    _form_question_settings jsonb,
     out validation_failure_message text,
     out created_form_question_settings forms.form_question_settings
 ) returns record
@@ -3685,8 +3703,17 @@ create or replace function forms.create_form_question_settings(
     security definer
 as
 $$
+declare
+    _form_question_id bigint := (_form_question_settings->>'form_question_id')::bigint;
+    _helper_text text := nullif(_form_question_settings->>'helper_text', '')::text;
+    _is_required boolean := (_form_question_settings->>'is_required')::boolean;
+    _placeholder_text text := nullif(_form_question_settings->>'placeholder_text', '')::text;
+    _minimum_length int := nullif(_form_question_settings->>'minimum_length', '')::int;
+    _maximum_length int := nullif(_form_question_settings->>'maximum_length', '')::int;
+    _minimum_date date := nullif(_form_question_settings->>'minimum_date', '')::date;
+    _maximum_date date := nullif(_form_question_settings->>'maximum_date', '')::date;
 begin
-    validation_failure_message := forms.validate_create_form_question_settings_input(_form_question_id, _helper_text, _is_required);
+    validation_failure_message := forms.validate_create_form_question_settings_input(_form_question_settings);
     if validation_failure_message is not null then
         return;
     end if;
@@ -3694,11 +3721,21 @@ begin
     insert into forms.form_question_settings (
         form_question_id,
         helper_text,
-        is_required
+        is_required,
+        placeholder_text,
+        minimum_length,
+        maximum_length,
+        minimum_date,
+        maximum_date
     ) values (
         _form_question_id, 
         _helper_text, 
-        _is_required
+        _is_required,
+        _placeholder_text,
+        _minimum_length,
+        _maximum_length,
+        _minimum_date,
+        _maximum_date
     ) returning * into created_form_question_settings;
 
     return;
@@ -3999,67 +4036,6 @@ $$
     where fqs.form_question_set_id = _form_question_set_id;
 $$;
 
-create or replace function api.create_form_template_question(
-    form_question_set_id bigint,
-    form_question_prompt text,
-    form_question_type forms.form_question_type,
-    form_question_position int,
-    form_question_settings jsonb default null
-) returns jsonb
-    language plpgsql
-    security definer
-as
-$$
-declare
-    _current_user_role users.user_role := auth.current_user_role();
-    _target_form_section_id bigint := forms.form_section_id_by_form_question_set_id(form_question_set_id);
-    _create_form_question_result record;
-    _create_form_question_settings_result record;
-    _updated_form_section_questions jsonb;
-begin
-    if _current_user_role not in ('org_admin', 'org_owner') then
-        raise exception 'Form Template Question Creation Failed'
-            using
-                detail = 'You are not authorized to create a form template question',
-                hint = 'unauthorized';
-    end if;
-
-    _create_form_question_result := forms.create_form_question(form_question_set_id, form_question_prompt, form_question_type, form_question_position);
-    if _create_form_question_result.validation_failure_message is not null then
-        raise exception 'Form Template Question Creation Failed'
-            using
-                detail = 'Invalid Request Payload',
-                hint = _create_form_question_result.validation_failure_message;
-    end if;
-
-    _create_form_question_settings_result := forms.create_form_question_settings(
-        (_create_form_question_result.created_form_question).form_question_id,
-        coalesce(form_question_settings->>'helper_text', null),
-        coalesce((form_question_settings->>'is_required')::boolean, false)
-    );
-
-    -- Return all the form section's questions including settings
-    select 
-        jsonb_agg(
-            to_jsonb(fq) || jsonb_build_object(
-                'form_question_settings', to_jsonb(fqsettings)
-            )
-            order by fq.form_question_position
-        ) into _updated_form_section_questions
-    from forms.form_question fq
-    join forms.form_question_settings fqsettings on fq.form_question_id = fqsettings.form_question_id
-    join forms.form_question_set fqs on fq.form_question_set_id = fqs.form_question_set_id
-    join forms.form_section fs on fqs.form_section_id = fs.form_section_id
-    where fs.form_section_id = _target_form_section_id;
-
-    return jsonb_build_object(
-        'form_questions', _updated_form_section_questions
-    );
-end;
-$$;
-
-grant execute on function api.create_form_template_question(bigint, text, forms.form_question_type, int, jsonb) to authenticated;
-
 create or replace function api.form_template_with_categories_and_sections(form_template_id bigint) returns jsonb
     language plpgsql
     security definer
@@ -4109,56 +4085,6 @@ $$;
 
 grant execute on function api.form_template_with_categories_and_sections(bigint) to authenticated;
 
-create or replace function api.form_template_section_question_sets_and_questions(form_section_id bigint) returns jsonb
-    language plpgsql
-    security definer
-as
-$$
-declare
-    _current_user_role users.user_role := auth.current_user_role();
-    _target_org_id bigint := auth.current_user_organization_id();
-    _target_form_id bigint := forms.form_id_by_form_section_id(form_section_id);
-    _target_form_organization_id bigint := forms.form_organization_id(_target_form_id);
-    _form_section_question_sets jsonb;
-    _form_section_questions jsonb;
-begin
-    if _current_user_role not in ('org_admin', 'org_owner') then
-        raise exception 'Form Template Section Question Sets And Questions Retrieval Failed'
-            using
-                detail = 'You are not authorized to retrieve the form template section question sets and questions',
-                hint = 'unauthorized';
-    end if;
-
-    select jsonb_agg(fqs order by fqs.form_question_set_position)
-    into _form_section_question_sets
-    from forms.form_question_set fqs
-    join forms.form_section fs on fqs.form_section_id = fs.form_section_id
-    where fs.form_section_id = $1
-    and _target_form_organization_id = _target_org_id;
-
-    select jsonb_agg(
-        to_jsonb(fq) || jsonb_build_object(
-            'form_question_settings', to_jsonb(fqsettings)
-        )
-        order by fq.form_question_position
-    )
-    into _form_section_questions
-    from forms.form_question fq
-    join forms.form_question_settings fqsettings on fq.form_question_id = fqsettings.form_question_id
-    join forms.form_question_set fqs on fq.form_question_set_id = fqs.form_question_set_id
-    join forms.form_section fs on fqs.form_section_id = fs.form_section_id
-    where fs.form_section_id = $1
-    and _target_form_organization_id = _target_org_id;
-
-    return jsonb_build_object(
-        'form_question_sets', _form_section_question_sets,
-        'form_questions', _form_section_questions
-    );
-end;
-$$;
-
-grant execute on function api.form_template_section_question_sets_and_questions(bigint) to authenticated;
-
 create or replace function forms.form_id_by_form_question_id(_form_question_id bigint) returns bigint
     language sql
     stable
@@ -4205,6 +4131,7 @@ declare
     _target_form_question_set_id bigint := forms.form_question_set_id_by_form_question_id(form_question_id);
     _target_form_question_position int := forms.form_question_position(form_question_id);
     _target_form_section_id bigint := forms.form_section_id_by_form_question_set_id(_target_form_question_set_id);
+    _r record;
     _remaining_form_section_questions jsonb;
 begin
     if _current_user_role not in ('org_admin', 'org_owner') and _target_form_organization_id != _target_org_id then
@@ -4217,15 +4144,32 @@ begin
     delete from forms.form_question fq
     where fq.form_question_id = $1;
 
-    -- Reorder the questions
-    update forms.form_question
-    set form_question_position = form_question_position - 1
-    where form_question_set_id = _target_form_question_set_id
-    and form_question_position > _target_form_question_position;
+    if not found then
+        raise exception 'Form Template Question Deletion Failed'
+            using
+                detail = 'Form Template Question not found',
+                hint = 'form_question_not_found';
+    end if;
+
+    for _r in (
+        select fq.form_question_id
+        from forms.form_question fq
+        where form_question_set_id = _target_form_question_set_id
+        and form_question_position > _target_form_question_position
+        order by form_question_position
+    )
+    loop
+        update forms.form_question fq
+        set form_question_position = form_question_position - 1
+        where fq.form_question_id = _r.form_question_id;
+    end loop;
 
     -- Return the remaining section questions
     select jsonb_agg(
-        fq
+        to_jsonb(fq) || jsonb_build_object(
+            'form_question_settings', to_jsonb(forms.form_question_settings(fq.form_question_id)),
+            'form_question_options', to_jsonb(forms.form_question_options(fq.form_question_id))
+        )
         order by fq.form_question_position
     ) into _remaining_form_section_questions
     from forms.form_question fq
@@ -4310,10 +4254,19 @@ create or replace function forms.validate_update_form_question_settings_input(
 as
 $$
 declare
+    _form_question_id bigint := (_form_question_settings->>'form_question_id')::bigint;
     _is_required boolean := (_form_question_settings->>'is_required')::boolean;
 begin
     if _is_required is null then
         return 'missing_is_required';
+    end if;
+
+    if not exists (
+        select 1
+        from forms.form_question fq
+        where fq.form_question_id = _form_question_id
+    ) then
+        return 'form_question_not_found';
     end if;
 
     return null;
@@ -4321,7 +4274,6 @@ end;
 $$;
 
 create or replace function forms.update_form_question_settings(
-    _form_question_id bigint,
     _form_question_settings jsonb,
     out validation_failure_message text,
     out updated_form_question_settings forms.form_question_settings
@@ -4331,8 +4283,14 @@ create or replace function forms.update_form_question_settings(
 as
 $$
 declare
+    _form_question_id bigint := (_form_question_settings->>'form_question_id')::bigint;
     _helper_text text := nullif(_form_question_settings->>'helper_text', '');
     _is_required boolean := (_form_question_settings->>'is_required')::boolean;
+    _placeholder_text text := nullif(_form_question_settings->>'placeholder_text', '');
+    _minimum_length int := nullif(_form_question_settings->>'minimum_length', '')::int;
+    _maximum_length int := nullif(_form_question_settings->>'maximum_length', '')::int;
+    _minimum_date date := nullif(_form_question_settings->>'minimum_date', '')::date;
+    _maximum_date date := nullif(_form_question_settings->>'maximum_date', '')::date;
 begin
     validation_failure_message := forms.validate_update_form_question_settings_input(_form_question_settings);
     if validation_failure_message is not null then
@@ -4341,11 +4299,295 @@ begin
 
     update forms.form_question_settings
     set helper_text = _helper_text,
-        is_required = _is_required
+        is_required = _is_required,
+        placeholder_text = _placeholder_text,
+        minimum_length = _minimum_length,
+        maximum_length = _maximum_length,
+        minimum_date = _minimum_date,
+        maximum_date = _maximum_date
     where form_question_id = _form_question_id
     returning * into updated_form_question_settings;
 end;
 $$;
+
+-- Form Question Options
+create table if not exists forms.form_question_option (
+    form_question_option_id bigint default utils.generate_random_id() not null primary key,
+    form_question_id bigint references forms.form_question(form_question_id) on delete cascade,
+    option_text text not null,
+    option_position int not null check (option_position > 0),
+    created_at timestamp with time zone default now() not null,
+    unique (form_question_id, option_position)
+);
+
+create or replace function forms.validate_create_form_question_options_input(
+    _form_question_id bigint,
+    _form_question_options jsonb
+) returns text
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _option jsonb;
+    _seen_positions int[];
+begin
+    if _form_question_id is null or _form_question_id <= 0 then
+        return 'missing_form_question_id';
+    end if;
+    
+    if _form_question_options is null or jsonb_array_length(_form_question_options) = 0 then
+        return 'missing_options';
+    end if;
+    
+    if not exists (
+        select 1
+        from forms.form_question fq
+        where fq.form_question_id = _form_question_id
+    ) then
+        return 'form_question_not_found';
+    end if;
+
+    _seen_positions := array[]::int[];
+    
+    for _option in select * from jsonb_array_elements(_form_question_options)
+    loop
+        if _option->>'option_text' is null or _option->>'option_text' = '' then
+            return 'missing_option_text';
+        end if;
+        
+        if (_option->>'option_position')::int is null or (_option->>'option_position')::int <= 0 then
+            return 'missing_option_position';
+        end if;
+        
+        -- Check for duplicate positions
+        if (_option->>'option_position')::int = any(_seen_positions) then
+            return 'duplicate_position';
+        end if;
+        
+        _seen_positions := array_append(_seen_positions, (_option->>'option_position')::int);
+    end loop;
+    
+    return null;
+end;
+$$;
+
+create or replace function forms.create_form_question_options(
+    _form_question_id bigint,
+    _form_question_options jsonb,
+    out validation_failure_message text,
+    out created_form_question_options forms.form_question_option[]
+) returns record
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _option_json jsonb;
+begin
+    validation_failure_message := forms.validate_create_form_question_options_input(_form_question_id, _form_question_options);
+    if validation_failure_message is not null then
+        return;
+    end if;
+
+    -- Create temporary table to hold new positions
+    create temporary table temp_positions (
+        old_position int,
+        new_position int
+    ) on commit drop;
+
+    -- Calculate new positions
+    for _option_json in select * from jsonb_array_elements(_form_question_options)
+    loop
+        insert into temp_positions (old_position, new_position)
+        select
+            option_position,
+            option_position + jsonb_array_length(_form_question_options)
+        from forms.form_question_option
+        where form_question_id = _form_question_id
+        and option_position >= (_option_json->>'option_position')::int;
+    end loop;
+
+    -- Update existing positions
+    update forms.form_question_option fqo
+    set option_position = tp.new_position
+    from temp_positions tp
+    where fqo.form_question_id = _form_question_id
+    and fqo.option_position = tp.old_position;
+
+    -- Insert new options
+    with inserted_options as (
+        select
+            (opt->>'option_text')::text as option_text,
+            (opt->>'option_position')::int as option_position
+        from jsonb_array_elements(_form_question_options) as opt
+    ),
+    new_options as (
+        insert into forms.form_question_option (
+            form_question_id,
+            option_text,
+            option_position
+        )
+        select
+            _form_question_id,
+            option_text,
+            option_position
+        from inserted_options
+        returning *
+    )
+    select array_agg(new_options.* order by new_options.option_position)
+    into created_form_question_options
+    from new_options;
+
+    return;
+end;
+$$;
+
+
+create or replace function forms.form_question_options(_form_question_id bigint) returns forms.form_question_option[]
+    language sql
+    stable
+as
+$$
+    select array_agg(fqo order by fqo.option_position)
+    from forms.form_question_option fqo
+    where fqo.form_question_id = _form_question_id;
+$$;
+
+create or replace function api.create_form_template_question(
+    form_question_set_id bigint,
+    form_question_prompt text,
+    form_question_type forms.form_question_type,
+    form_question_position int,
+    form_question_settings jsonb default null,
+    form_question_options jsonb default null
+) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_user_role users.user_role := auth.current_user_role();
+    _target_form_section_id bigint := forms.form_section_id_by_form_question_set_id(form_question_set_id);
+    _create_form_question_result record;
+    _create_form_question_settings_result record;
+    _create_form_question_options_result record;
+    _updated_form_section_questions jsonb;
+begin
+    if _current_user_role not in ('org_admin', 'org_owner') then
+        raise exception 'Form Template Question Creation Failed'
+            using
+                detail = 'You are not authorized to create a form template question',
+                hint = 'unauthorized';
+    end if;
+
+    _create_form_question_result := forms.create_form_question(form_question_set_id, form_question_prompt, form_question_type, form_question_position);
+    if _create_form_question_result.validation_failure_message is not null then
+        raise exception 'Form Template Question Creation Failed'
+            using
+                detail = 'Invalid Request Payload',
+                hint = _create_form_question_result.validation_failure_message;
+    end if;
+
+    _create_form_question_settings_result := forms.create_form_question_settings(
+        jsonb_build_object(
+            'form_question_id', (_create_form_question_result.created_form_question).form_question_id
+        ) || coalesce(form_question_settings, '{}'::jsonb)
+    );
+
+    if _create_form_question_settings_result.validation_failure_message is not null then
+        raise exception 'Form Template Question Settings Creation Failed'
+            using
+                detail = 'Invalid Request Payload',
+                hint = _create_form_question_settings_result.validation_failure_message;
+    end if;
+
+    if form_question_options is not null then
+        _create_form_question_options_result := forms.create_form_question_options(
+            (_create_form_question_result.created_form_question).form_question_id,
+            form_question_options
+        );
+
+        if _create_form_question_options_result.validation_failure_message is not null then
+            raise exception 'Form Template Question Options Creation Failed'
+                using
+                    detail = 'Invalid Request Payload',
+                    hint = _create_form_question_options_result.validation_failure_message;
+        end if;
+    end if;
+
+    -- Return all the form section's questions including settings and options using the new functions
+    select 
+        jsonb_agg(
+            to_jsonb(fq) || jsonb_build_object(
+                'form_question_settings', to_jsonb(forms.form_question_settings(fq.form_question_id)),
+                'form_question_options', to_jsonb(forms.form_question_options(fq.form_question_id))
+            )
+            order by fq.form_question_position
+        ) into _updated_form_section_questions
+    from forms.form_question fq
+    join forms.form_question_set fqs on fq.form_question_set_id = fqs.form_question_set_id
+    join forms.form_section fs on fqs.form_section_id = fs.form_section_id
+    where fs.form_section_id = _target_form_section_id;
+
+    return jsonb_build_object(
+        'form_questions', _updated_form_section_questions
+    );
+end;
+$$;
+
+grant execute on function api.create_form_template_question(bigint, text, forms.form_question_type, int, jsonb, jsonb) to authenticated;
+
+create or replace function api.form_template_section_question_sets_and_questions(form_section_id bigint) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_user_role users.user_role := auth.current_user_role();
+    _target_org_id bigint := auth.current_user_organization_id();
+    _target_form_id bigint := forms.form_id_by_form_section_id(form_section_id);
+    _target_form_organization_id bigint := forms.form_organization_id(_target_form_id);
+    _form_section_question_sets jsonb;
+    _form_section_questions jsonb;
+begin
+    if _current_user_role not in ('org_admin', 'org_owner') then
+        raise exception 'Form Template Section Question Sets And Questions Retrieval Failed'
+            using
+                detail = 'You are not authorized to retrieve the form template section question sets and questions',
+                hint = 'unauthorized';
+    end if;
+
+    select jsonb_agg(fqs order by fqs.form_question_set_position)
+    into _form_section_question_sets
+    from forms.form_question_set fqs
+    join forms.form_section fs on fqs.form_section_id = fs.form_section_id
+    where fs.form_section_id = $1
+    and _target_form_organization_id = _target_org_id;
+
+    select jsonb_agg(
+        to_jsonb(fq) || jsonb_build_object(
+            'form_question_settings', to_jsonb(forms.form_question_settings(fq.form_question_id)),
+            'form_question_options', to_jsonb(forms.form_question_options(fq.form_question_id))
+        )
+        )
+        order by fq.form_question_position
+    )
+    into _form_section_questions
+    from forms.form_question fq
+    join forms.form_question_set fqs on fq.form_question_set_id = fqs.form_question_set_id
+    join forms.form_section fs on fqs.form_section_id = fs.form_section_id
+    where fs.form_section_id = $1
+    and _target_form_organization_id = _target_org_id;
+
+    return jsonb_build_object(
+        'form_question_sets', _form_section_question_sets,
+        'form_questions', _form_section_questions
+    );
+end;
+$$;
+
+grant execute on function api.form_template_section_question_sets_and_questions(bigint) to authenticated;
 
 create or replace function api.update_form_template_question(
     updated_form_question jsonb
@@ -4364,7 +4606,6 @@ declare
     _target_form_section_id bigint := forms.form_section_id_by_form_question_set_id(_target_form_question_set_id);
     _form_question_settings jsonb := updated_form_question->'form_question_settings';
     _update_form_question_result record;
-    _update_form_question_settings_result record;
     _updated_form_section_questions jsonb;
 begin
     if _current_user_role not in ('org_admin', 'org_owner') and _target_form_organization_id != _target_org_id then
@@ -4382,23 +4623,15 @@ begin
                 hint = _update_form_question_result.validation_failure_message;
     end if;
 
-    _update_form_question_settings_result := forms.update_form_question_settings(_form_question_id, _form_question_settings);
-    if _update_form_question_settings_result.validation_failure_message is not null then
-        raise exception 'Form Template Question Settings Update Failed'
-            using
-                detail = 'Invalid Request Payload',
-                hint = _update_form_question_settings_result.validation_failure_message;
-    end if;
-
     -- Return the updated questions with their settings inside the section
     select jsonb_agg(
         to_jsonb(fq) || jsonb_build_object(
-            'form_question_settings', to_jsonb(fqsettings)
+            'form_question_settings', to_jsonb(forms.form_question_settings(fq.form_question_id)),
+            'form_question_options', to_jsonb(forms.form_question_options(fq.form_question_id))
         )
         order by fq.form_question_position
     ) into _updated_form_section_questions
     from forms.form_question fq
-    join forms.form_question_settings fqsettings on fq.form_question_id = fqsettings.form_question_id
     join forms.form_question_set fqs on fq.form_question_set_id = fqs.form_question_set_id
     join forms.form_section fs on fqs.form_section_id = fs.form_section_id
     where fs.form_section_id = _target_form_section_id;
@@ -4410,5 +4643,186 @@ end;
 $$;
 
 grant execute on function api.update_form_template_question(jsonb) to authenticated;
+
+create or replace function forms.update_form_question_option(
+    _form_question_option_id bigint,
+    _form_question_option_text text,
+    _form_question_option_position int
+) returns void
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _original_position int;
+    _form_question_id bigint;
+    _r record;
+begin
+    -- Get the original position and form_question_id
+    select option_position, form_question_id
+    into _original_position, _form_question_id
+    from forms.form_question_option
+    where form_question_option_id = _form_question_option_id;
+
+    -- Create temporary table for position updates
+    create temp table temp_positions (
+        form_question_option_id bigint,
+        current_position int,
+        new_position int
+    ) on commit drop;
+
+    if _form_question_option_position > _original_position then
+        -- Moving down: shift intervening options up
+        insert into temp_positions
+        select 
+            form_question_option_id,
+            option_position,
+            option_position - 1
+        from forms.form_question_option
+        where form_question_id = _form_question_id
+        and option_position > _original_position
+        and option_position <= _form_question_option_position;
+    elsif _form_question_option_position < _original_position then
+        -- Moving up: shift intervening options down
+        insert into temp_positions
+        select 
+            form_question_option_id,
+            option_position,
+            option_position + 1
+        from forms.form_question_option
+        where form_question_id = _form_question_id
+        and option_position >= _form_question_option_position
+        and option_position < _original_position;
+    end if;
+
+    -- Update positions one by one to maintain uniqueness constraint
+    for _r in (
+        select * from temp_positions
+        order by 
+            case when _form_question_option_position > _original_position then current_position
+            else -current_position end
+    ) loop
+        update forms.form_question_option
+        set option_position = _r.new_position
+        where form_question_option_id = _r.form_question_option_id;
+    end loop;
+
+    -- Clean up the temporary table
+    drop table temp_positions;
+
+    -- Finally, update the target option
+    update forms.form_question_option
+    set 
+        option_text = _form_question_option_text,
+        option_position = _form_question_option_position
+    where form_question_option_id = _form_question_option_id;
+end;
+$$;
+
+create or replace function forms.delete_form_question_option(
+    _form_question_option_id bigint
+) returns void
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _target_form_question_id bigint;
+    _target_form_question_option_position bigint;
+begin
+    select option_position, form_question_id
+    into _target_form_question_option_position, _target_form_question_id
+    from forms.form_question_option
+    where form_question_option_id = _form_question_option_id;
+
+    -- Delete the form question option. shift all the options above it down
+    delete from forms.form_question_option fqo
+    where fqo.form_question_option_id = _form_question_option_id;
+
+    -- Shift all the options above it down
+    with options_to_update as (
+        select form_question_option_id, option_position
+        from forms.form_question_option
+        where form_question_id = _target_form_question_id
+        and option_position > _target_form_question_option_position
+    )
+    update forms.form_question_option fqo
+    set option_position = fqo.option_position - 1
+    from options_to_update otu
+    where fqo.form_question_option_id = otu.form_question_option_id;
+end;
+$$;
+
+create or replace function forms.create_form_question_option(
+    _form_question_id bigint,
+    _option_text text,
+    _option_position int
+) returns void
+    language plpgsql
+    security definer
+as
+$$
+declare
+begin
+    -- Shift all options at or after the target position up by 1
+    with options_to_update as (
+        select form_question_option_id, option_position
+        from forms.form_question_option
+        where form_question_id = _form_question_id
+        and option_position >= _option_position
+    )
+    update forms.form_question_option fqo
+    set option_position = fqo.option_position + 1
+    from options_to_update otu
+    where fqo.form_question_option_id = otu.form_question_option_id;
+
+    -- Insert the new option at the desired position
+    insert into forms.form_question_option (
+        form_question_id,
+        option_text,
+        option_position
+    ) values (
+        _form_question_id,
+        _option_text,
+        _option_position
+    );
+end;
+$$;
+
+create or replace function api.update_form_template_question_settings(
+    updated_form_question_settings jsonb
+) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_user_role users.user_role := auth.current_user_role();
+    _update_form_question_settings_result record;
+begin
+    if _current_user_role not in ('org_admin', 'org_owner') then
+        raise exception 'Form Template Question Settings Update Failed'
+            using
+                detail = 'You are not authorized to update the form template question settings',
+                hint = 'unauthorized';
+    end if;
+
+    _update_form_question_settings_result := forms.update_form_question_settings(updated_form_question_settings);
+
+    if _update_form_question_settings_result.validation_failure_message is not null then
+        raise exception 'Form Template Question Settings Update Failed'
+            using
+                detail = 'Invalid Request Payload',
+                hint = _update_form_question_settings_result.validation_failure_message;
+    end if;
+
+    return jsonb_build_object(
+        'form_question_settings', to_jsonb(_update_form_question_settings_result.updated_form_question_settings)
+    );
+end;
+$$;
+
+grant execute on function api.update_form_template_question_settings(jsonb) to authenticated;
+
 
 commit;
