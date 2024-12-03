@@ -4182,7 +4182,8 @@ begin
     select jsonb_agg(
         to_jsonb(fq) || jsonb_build_object(
             'form_question_settings', to_jsonb(forms.form_question_settings(fq.form_question_id)),
-            'form_question_options', to_jsonb(forms.form_question_options(fq.form_question_id))
+            'form_question_options', to_jsonb(forms.form_question_options(fq.form_question_id)),
+            'form_question_default_options', to_jsonb(forms.form_question_default_options(fq.form_question_id))
         )
         order by fq.form_question_position
     ) into _remaining_form_section_questions
@@ -4333,7 +4334,8 @@ create table if not exists forms.form_question_option (
     option_text text not null,
     option_position int not null check (option_position > 0),
     created_at timestamp with time zone default now() not null,
-    unique (form_question_id, option_position)
+    unique (form_question_id, option_position),
+    unique (form_question_id, form_question_option_id)
 );
 
 create or replace function forms.validate_create_form_question_options_input(
@@ -4470,6 +4472,148 @@ $$
     where fqo.form_question_id = _form_question_id;
 $$;
 
+create table if not exists forms.form_question_default_option (
+    form_question_id bigint not null references forms.form_question(form_question_id) on delete cascade,
+    form_question_option_id bigint not null references forms.form_question_option(form_question_option_id) on delete cascade,
+    primary key (form_question_id, form_question_option_id),
+    foreign key (form_question_id, form_question_option_id) 
+        references forms.form_question_option(form_question_id, form_question_option_id)
+);
+
+create or replace function forms.form_question_default_options(
+    _form_question_id bigint
+) returns forms.form_question_default_option[]
+    language sql
+    stable
+as
+$$
+    select array_agg(fqdo order by fqdo.form_question_option_id)
+    from forms.form_question_default_option fqdo
+    where fqdo.form_question_id = _form_question_id;
+$$;
+
+create or replace function forms.validate_create_form_question_default_option_input(
+    _form_question_id bigint,
+    _form_question_option_id bigint
+) returns text
+    language plpgsql
+    security definer
+as
+$$
+begin
+    if _form_question_id is null or _form_question_id <= 0 then
+        return 'missing_form_question_id';
+    end if;
+
+    if _form_question_option_id is null or _form_question_option_id <= 0 then
+        return 'missing_form_question_option_id';
+    end if;
+
+    if not exists (
+        select 1
+        from forms.form_question_option fqo
+        where fqo.form_question_option_id = _form_question_option_id
+        and fqo.form_question_id = _form_question_id
+    ) then
+        return 'form_question_option_not_found';
+    end if;
+
+    if not exists (
+        select 1
+        from forms.form_question fq
+        where fq.form_question_id = _form_question_id
+    ) then
+        return 'form_question_not_found';
+    end if;
+
+    if exists (
+        select 1
+        from forms.form_question_default_option fqdo
+        where fqdo.form_question_id = _form_question_id
+        and fqdo.form_question_option_id = _form_question_option_id
+    ) then
+        return 'form_question_default_option_already_exists';
+    end if;
+
+    return null;
+end;
+$$;
+
+create or replace function forms.create_form_question_default_option(
+    _form_question_id bigint,
+    _form_question_option_id bigint,
+    out validation_failure_message text,
+    out created_form_question_default_option forms.form_question_default_option
+) returns record
+    language plpgsql
+    security definer
+as
+$$
+begin
+    validation_failure_message := forms.validate_create_form_question_default_option_input(_form_question_id, _form_question_option_id);
+    if validation_failure_message is not null then
+        return;
+    end if;
+
+    insert into forms.form_question_default_option (form_question_id, form_question_option_id)
+    values (_form_question_id, _form_question_option_id)
+    returning * into created_form_question_default_option;
+end;
+$$;
+
+create or replace function forms.validate_delete_form_question_default_option_input(
+    _form_question_id bigint,
+    _form_question_option_id bigint
+) returns text
+    language plpgsql
+    security definer
+as
+$$
+begin
+    if _form_question_id is null or _form_question_id <= 0 then
+        return 'missing_form_question_id';
+    end if;
+
+    if _form_question_option_id is null or _form_question_option_id <= 0 then
+        return 'missing_form_question_option_id';
+    end if;
+
+    if not exists (
+        select 1
+        from forms.form_question_default_option fqdo
+        where fqdo.form_question_id = _form_question_id
+        and fqdo.form_question_option_id = _form_question_option_id
+    ) then
+        return 'form_question_default_option_not_found';
+    end if;
+
+    return null;
+end;
+$$;
+
+create or replace function forms.delete_form_question_default_option(
+    _form_question_id bigint,
+    _form_question_option_id bigint,
+    out validation_failure_message text
+) returns text
+    language plpgsql
+    security definer
+as
+$$
+begin
+    validation_failure_message := forms.validate_delete_form_question_default_option_input(_form_question_id, _form_question_option_id);
+    if validation_failure_message is not null then
+        return;
+    end if;
+
+    delete from forms.form_question_default_option
+    where form_question_id = _form_question_id
+    and form_question_option_id = _form_question_option_id;
+
+    return;
+end;
+$$;
+
 create or replace function api.create_form_template_question(
     form_question_set_id bigint,
     form_question_prompt text,
@@ -4537,7 +4681,8 @@ begin
         jsonb_agg(
             to_jsonb(fq) || jsonb_build_object(
                 'form_question_settings', to_jsonb(forms.form_question_settings(fq.form_question_id)),
-                'form_question_options', to_jsonb(forms.form_question_options(fq.form_question_id))
+                'form_question_options', to_jsonb(forms.form_question_options(fq.form_question_id)),
+                'form_question_default_options', to_jsonb(forms.form_question_default_options(fq.form_question_id))
             )
             order by fq.form_question_position
         ) into _updated_form_section_questions
@@ -4555,8 +4700,8 @@ $$;
 grant execute on function api.create_form_template_question(bigint, text, forms.form_question_type, int, jsonb, jsonb) to authenticated;
 
 create or replace function api.form_template_section_question_sets_and_questions(form_section_id bigint) returns jsonb
-    language plpgsql
     security definer
+    language plpgsql
 as
 $$
 declare
@@ -4584,8 +4729,8 @@ begin
     select jsonb_agg(
         to_jsonb(fq) || jsonb_build_object(
             'form_question_settings', to_jsonb(forms.form_question_settings(fq.form_question_id)),
-            'form_question_options', to_jsonb(forms.form_question_options(fq.form_question_id))
-        )
+            'form_question_options', to_jsonb(forms.form_question_options(fq.form_question_id)),
+            'form_question_default_options', to_jsonb(forms.form_question_default_options(fq.form_question_id))
         )
         order by fq.form_question_position
     )
@@ -4620,7 +4765,6 @@ declare
     _target_org_id bigint := auth.current_user_organization_id();
     _target_form_organization_id bigint := forms.form_organization_id(_target_form_id);
     _target_form_section_id bigint := forms.form_section_id_by_form_question_set_id(_target_form_question_set_id);
-    _form_question_settings jsonb := updated_form_question->'form_question_settings';
     _update_form_question_result record;
     _updated_form_section_questions jsonb;
 begin
@@ -4643,7 +4787,8 @@ begin
     select jsonb_agg(
         to_jsonb(fq) || jsonb_build_object(
             'form_question_settings', to_jsonb(forms.form_question_settings(fq.form_question_id)),
-            'form_question_options', to_jsonb(forms.form_question_options(fq.form_question_id))
+            'form_question_options', to_jsonb(forms.form_question_options(fq.form_question_id)),
+            'form_question_default_options', to_jsonb(forms.form_question_default_options(fq.form_question_id))
         )
         order by fq.form_question_position
     ) into _updated_form_section_questions
@@ -5035,6 +5180,93 @@ $$;
 
 grant execute on function api.delete_form_template_question_option(bigint) to authenticated;
 
-commit;
+create or replace function api.update_form_template_question_default_options(
+    form_question_id bigint,
+    updated_form_question_default_options jsonb
+) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_user_role users.user_role := auth.current_user_role();
+    _existing_form_question_default_options forms.form_question_default_option[] := forms.form_question_default_options(form_question_id);
+    _input_form_question_default_options forms.form_question_default_option[];
+    _form_question_option record;
+    _create_form_question_default_option_result record;
+    _delete_form_question_default_option_result text;
+    _remaining_form_question_default_options forms.form_question_default_option[];
+begin
+    if _current_user_role not in ('org_admin', 'org_owner') then
+        raise exception 'Form Template Question Default Options Update Failed'
+            using
+                detail = 'You are not authorized to update the form template question default options',
+                hint = 'unauthorized';
+    end if;
+
+    -- Parse input JSON array into form_question_default_option records
+    select array_agg(row(
+        form_question_id,
+        (elem->>'form_question_option_id')::bigint
+    )::forms.form_question_default_option)
+    into _input_form_question_default_options
+    from jsonb_array_elements(updated_form_question_default_options) as elem;
+
+    -- Delete existing options that are not in the input array
+    for _form_question_option in
+        select e.form_question_option_id
+        from unnest(_existing_form_question_default_options) e
+        where not exists (
+            select 1
+            from unnest(_input_form_question_default_options) i
+            where i.form_question_option_id = e.form_question_option_id
+        )
+    loop
+        _delete_form_question_default_option_result := forms.delete_form_question_default_option(
+            form_question_id,
+            _form_question_option.form_question_option_id
+        );
+
+        if _delete_form_question_default_option_result is not null then
+            raise exception 'Form Template Question Default Options Update Failed'
+                using
+                    detail = 'Failed to delete existing option',
+                    hint = _delete_form_question_default_option_result;
+        end if;
+    end loop;
+
+    -- Create new options that don't exist in the database
+    for _form_question_option in
+        select i.form_question_option_id
+        from unnest(_input_form_question_default_options) i
+        where not exists (
+            select 1
+            from unnest(_existing_form_question_default_options) e
+            where e.form_question_option_id = i.form_question_option_id
+        )
+    loop
+        _create_form_question_default_option_result := forms.create_form_question_default_option(
+            form_question_id,
+            _form_question_option.form_question_option_id
+        );
+
+        if _create_form_question_default_option_result.validation_failure_message is not null then
+            raise exception 'Form Template Question Default Options Update Failed'
+                using
+                    detail = 'Failed to create new option',
+                    hint = _create_form_question_default_option_result.validation_failure_message;
+        end if;
+    end loop;
+
+    -- Return the updated form question default options for the question
+    _remaining_form_question_default_options := forms.form_question_default_options(form_question_id);
+
+    return jsonb_build_object(
+        'form_question_default_options', to_jsonb(_remaining_form_question_default_options)
+    );
+end;
+$$;
+
+grant execute on function api.update_form_template_question_default_options(bigint, jsonb) to authenticated;
 
 commit;

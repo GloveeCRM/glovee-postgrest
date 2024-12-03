@@ -26,7 +26,7 @@ end$$;
 begin;
 
 -- Drop Forms
-drop function if exists api.delete_form_template_question_option(bigint);
+drop function if exists api.update_form_template_question_default_options(bigint, jsonb);
 drop function if exists api.update_form_template_question_option(jsonb);
 drop function if exists forms.update_form_question_option(jsonb);
 drop function if exists forms.validate_update_form_question_option_input(bigint, text, int);
@@ -37,6 +37,12 @@ drop function if exists api.update_form_template_question_settings(jsonb);
 drop function if exists api.create_form_template_question(bigint, text, forms.form_question_type, int, jsonb, jsonb);
 drop function forms.create_form_question_options(bigint, jsonb);
 drop function forms.validate_create_form_question_options_input(bigint, jsonb);
+drop function if exists forms.create_form_question_default_option(bigint, bigint);
+drop function if exists forms.validate_create_form_question_default_option_input(bigint, bigint);
+drop function if exists forms.delete_form_question_default_option(bigint, bigint);
+drop function if exists forms.validate_delete_form_question_default_option_input(bigint, bigint);
+drop function if exists forms.form_question_default_options(bigint);
+drop table if exists forms.form_question_default_option;
 drop table if exists forms.form_question_option;
 drop function if exists forms.form_question_options(bigint);
 drop function if exists forms.form_question_settings(bigint);
