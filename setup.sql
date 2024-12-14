@@ -3496,8 +3496,8 @@ create table if not exists forms.form_question_set (
     form_section_id bigint references forms.form_section(form_section_id) on delete cascade,
     form_question_set_type forms.form_question_set_type not null,
     form_question_set_position int not null check (form_question_set_position > 0),
-    depends_on_option_id bigint,
-    parent_form_question_set_id bigint references forms.form_question_set(form_question_set_id) on delete cascade,
+    depends_on_option_id bigint null references forms.form_question_option(form_question_option_id) on delete cascade deferrable initially deferred,
+    parent_form_question_set_id bigint references forms.form_question_set(form_question_set_id) on delete cascade deferrable initially deferred,
     created_at timestamp with time zone default now() not null,
     unique (parent_form_question_set_id, form_question_set_position)
 );
@@ -3551,6 +3551,16 @@ create table if not exists forms.form_question_settings (
     created_at timestamp with time zone default now() not null,
     unique (form_question_id)
 );
+
+create or replace function forms.form_section_question_sets(_form_section_id bigint) returns forms.form_question_set[]
+    language sql
+    stable
+as
+$$
+    select array_agg(fqs order by fqs.form_question_set_position)
+    from forms.form_question_set fqs
+    where fqs.form_section_id = _form_section_id;
+$$;
 
 create or replace function forms.form_question_settings(_form_question_id bigint) returns forms.form_question_settings
     language sql
@@ -3882,56 +3892,6 @@ begin
 end;
 $$;
 
-create or replace function api.create_form_template_question_set(
-    form_section_id bigint,
-    form_question_set_type forms.form_question_set_type,
-    form_question_set_position int,
-    depends_on_option_id bigint default null,
-    parent_form_question_set_id bigint default null
-) returns jsonb
-    language plpgsql
-    security definer
-as
-$$
-declare
-    _current_user_role users.user_role := auth.current_user_role();
-    _create_form_question_set_result record;
-    _updated_form_section_question_sets forms.form_question_set[];
-begin
-    if _current_user_role not in ('org_admin', 'org_owner') then
-        raise exception 'Form Template Question Set Creation Failed'
-            using
-                detail = 'You are not authorized to create a form template question set',
-                hint = 'unauthorized';
-    end if;
-
-    _create_form_question_set_result := forms.create_form_question_set(form_section_id, form_question_set_type, form_question_set_position, depends_on_option_id, parent_form_question_set_id);
-    if _create_form_question_set_result.validation_failure_message is not null then
-        raise exception 'Form Template Question Set Creation Failed'
-            using
-                detail = 'Invalid Request Payload',
-                hint = _create_form_question_set_result.validation_failure_message;
-    end if;
-
-    -- Retrieve the updated form section question sets
-    select 
-        array_agg(
-            fqs
-        order by
-            fqs.form_question_set_position
-        ) into _updated_form_section_question_sets
-    from forms.form_question_set fqs
-    join forms.form_section fs on fqs.form_section_id = fs.form_section_id
-    where fs.form_section_id = $1;
-
-    return jsonb_build_object(
-        'form_question_sets', _updated_form_section_question_sets
-    );
-end;
-$$;
-
-grant execute on function api.create_form_template_question_set(bigint, forms.form_question_set_type, int, bigint, bigint) to authenticated;
-
 create or replace function forms.form_section_id_by_form_question_set_id(_form_question_set_id bigint) returns bigint
     language sql
     stable
@@ -3981,7 +3941,6 @@ declare
     _target_form_section_id bigint := forms.form_section_id_by_form_question_set_id(form_question_set_id);
     _target_form_id bigint := forms.form_id_by_form_section_id(_target_form_section_id);
     _target_form_organization_id bigint := forms.form_organization_id(_target_form_id);
-    _remaining_form_section_question_sets jsonb;
 begin
     if _current_user_role not in ('org_admin', 'org_owner') then
         raise exception 'Form Template Question Set Deletion Failed'
@@ -4019,19 +3978,8 @@ begin
         and form_question_set_position > _target_form_question_set_position;
     end if;
 
-    -- Return remaining section question sets
-    select json_agg(
-        fqs 
-        order by 
-            fqs.form_question_set_position
-    ) into _remaining_form_section_question_sets
-    from forms.form_question_set fqs
-    join forms.form_section fs on fqs.form_section_id = fs.form_section_id
-    where fs.form_section_id = _target_form_section_id;
-
     return jsonb_build_object(
-        'form_question_sets', 
-        _remaining_form_section_question_sets
+        'form_question_sets', to_jsonb(forms.form_section_question_sets(_target_form_section_id))
     );
 end;
 $$;
@@ -4132,6 +4080,30 @@ $$
     where fq.form_question_id = _form_question_id;
 $$;
 
+create or replace function forms.form_section_questions(_form_section_id bigint) returns jsonb
+    language plpgsql
+    stable
+as
+$$
+declare
+    _form_section_questions jsonb;
+begin
+    select jsonb_agg(
+        to_jsonb(fq) || jsonb_build_object(
+            'form_question_settings', to_jsonb(forms.form_question_settings(fq.form_question_id)),
+            'form_question_options', to_jsonb(forms.form_question_options(fq.form_question_id)),
+            'form_question_default_options', to_jsonb(forms.form_question_default_options(fq.form_question_id))
+        )
+        order by fq.form_question_position
+    ) into _form_section_questions
+    from forms.form_question fq
+    join forms.form_question_set fqs on fq.form_question_set_id = fqs.form_question_set_id
+    where fqs.form_section_id = _form_section_id;
+
+    return _form_section_questions;
+end;
+$$;
+
 create or replace function api.delete_form_template_question(form_question_id bigint) returns jsonb
     language plpgsql
     security definer
@@ -4146,7 +4118,6 @@ declare
     _target_form_question_position int := forms.form_question_position(form_question_id);
     _target_form_section_id bigint := forms.form_section_id_by_form_question_set_id(_target_form_question_set_id);
     _r record;
-    _remaining_form_section_questions jsonb;
 begin
     if _current_user_role not in ('org_admin', 'org_owner') and _target_form_organization_id != _target_org_id then
         raise exception 'Form Template Question Deletion Failed'
@@ -4178,22 +4149,8 @@ begin
         where fq.form_question_id = _r.form_question_id;
     end loop;
 
-    -- Return the remaining section questions
-    select jsonb_agg(
-        to_jsonb(fq) || jsonb_build_object(
-            'form_question_settings', to_jsonb(forms.form_question_settings(fq.form_question_id)),
-            'form_question_options', to_jsonb(forms.form_question_options(fq.form_question_id)),
-            'form_question_default_options', to_jsonb(forms.form_question_default_options(fq.form_question_id))
-        )
-        order by fq.form_question_position
-    ) into _remaining_form_section_questions
-    from forms.form_question fq
-    join forms.form_question_set fqs on fq.form_question_set_id = fqs.form_question_set_id
-    join forms.form_section fs on fqs.form_section_id = fs.form_section_id
-    where fs.form_section_id = _target_form_section_id;
-
     return jsonb_build_object(
-        'form_questions', _remaining_form_section_questions
+        'form_questions', forms.form_section_questions(_target_form_section_id)
     );
 end;
 $$;
@@ -4632,7 +4589,6 @@ declare
     _create_form_question_result record;
     _create_form_question_settings_result record;
     _create_form_question_options_result record;
-    _updated_form_section_questions jsonb;
 begin
     if _current_user_role not in ('org_admin', 'org_owner') then
         raise exception 'Form Template Question Creation Failed'
@@ -4676,23 +4632,8 @@ begin
         end if;
     end if;
 
-    -- Return all the form section's questions including settings and options using the new functions
-    select 
-        jsonb_agg(
-            to_jsonb(fq) || jsonb_build_object(
-                'form_question_settings', to_jsonb(forms.form_question_settings(fq.form_question_id)),
-                'form_question_options', to_jsonb(forms.form_question_options(fq.form_question_id)),
-                'form_question_default_options', to_jsonb(forms.form_question_default_options(fq.form_question_id))
-            )
-            order by fq.form_question_position
-        ) into _updated_form_section_questions
-    from forms.form_question fq
-    join forms.form_question_set fqs on fq.form_question_set_id = fqs.form_question_set_id
-    join forms.form_section fs on fqs.form_section_id = fs.form_section_id
-    where fs.form_section_id = _target_form_section_id;
-
     return jsonb_build_object(
-        'form_questions', _updated_form_section_questions
+        'form_questions', forms.form_section_questions(_target_form_section_id)
     );
 end;
 $$;
@@ -4706,11 +4647,6 @@ as
 $$
 declare
     _current_user_role users.user_role := auth.current_user_role();
-    _target_org_id bigint := auth.current_user_organization_id();
-    _target_form_id bigint := forms.form_id_by_form_section_id(form_section_id);
-    _target_form_organization_id bigint := forms.form_organization_id(_target_form_id);
-    _form_section_question_sets jsonb;
-    _form_section_questions jsonb;
 begin
     if _current_user_role not in ('org_admin', 'org_owner') then
         raise exception 'Form Template Section Question Sets And Questions Retrieval Failed'
@@ -4719,31 +4655,9 @@ begin
                 hint = 'unauthorized';
     end if;
 
-    select jsonb_agg(fqs order by fqs.form_question_set_position)
-    into _form_section_question_sets
-    from forms.form_question_set fqs
-    join forms.form_section fs on fqs.form_section_id = fs.form_section_id
-    where fs.form_section_id = $1
-    and _target_form_organization_id = _target_org_id;
-
-    select jsonb_agg(
-        to_jsonb(fq) || jsonb_build_object(
-            'form_question_settings', to_jsonb(forms.form_question_settings(fq.form_question_id)),
-            'form_question_options', to_jsonb(forms.form_question_options(fq.form_question_id)),
-            'form_question_default_options', to_jsonb(forms.form_question_default_options(fq.form_question_id))
-        )
-        order by fq.form_question_position
-    )
-    into _form_section_questions
-    from forms.form_question fq
-    join forms.form_question_set fqs on fq.form_question_set_id = fqs.form_question_set_id
-    join forms.form_section fs on fqs.form_section_id = fs.form_section_id
-    where fs.form_section_id = $1
-    and _target_form_organization_id = _target_org_id;
-
     return jsonb_build_object(
-        'form_question_sets', _form_section_question_sets,
-        'form_questions', _form_section_questions
+        'form_question_sets', to_jsonb(forms.form_section_question_sets($1)),
+        'form_questions', forms.form_section_questions($1)
     );
 end;
 $$;
@@ -4782,20 +4696,6 @@ begin
                 detail = 'Invalid Request Payload',
                 hint = _update_form_question_result.validation_failure_message;
     end if;
-
-    -- Return the updated questions with their settings inside the section
-    select jsonb_agg(
-        to_jsonb(fq) || jsonb_build_object(
-            'form_question_settings', to_jsonb(forms.form_question_settings(fq.form_question_id)),
-            'form_question_options', to_jsonb(forms.form_question_options(fq.form_question_id)),
-            'form_question_default_options', to_jsonb(forms.form_question_default_options(fq.form_question_id))
-        )
-        order by fq.form_question_position
-    ) into _updated_form_section_questions
-    from forms.form_question fq
-    join forms.form_question_set fqs on fq.form_question_set_id = fqs.form_question_set_id
-    join forms.form_section fs on fqs.form_section_id = fs.form_section_id
-    where fs.form_section_id = _target_form_section_id;
 
     return jsonb_build_object(
         'form_questions', _updated_form_section_questions
@@ -5268,5 +5168,103 @@ end;
 $$;
 
 grant execute on function api.update_form_template_question_default_options(bigint, jsonb) to authenticated;
+
+create or replace function api.create_form_template_question_set(
+    form_section_id bigint,
+    form_question_set_type forms.form_question_set_type,
+    form_question_set_position int,
+    depends_on_option_id bigint default null,
+    parent_form_question_set_id bigint default null
+) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_user_role users.user_role := auth.current_user_role();
+    _create_form_question_set_result record;
+    _create_form_question_result record;
+    _create_form_question_settings_result record;
+    _create_form_question_options_result record;
+    _create_form_question_default_option_result record;
+begin
+    if _current_user_role not in ('org_admin', 'org_owner') then
+        raise exception 'Form Template Question Set Creation Failed'
+            using
+                detail = 'You are not authorized to create a form template question set',
+                hint = 'unauthorized';
+    end if;
+
+    _create_form_question_set_result := forms.create_form_question_set(form_section_id, form_question_set_type, form_question_set_position, depends_on_option_id, parent_form_question_set_id);
+    if _create_form_question_set_result.validation_failure_message is not null then
+        raise exception 'Form Template Question Set Creation Failed'
+            using
+                detail = 'Invalid Request Payload',
+                hint = _create_form_question_set_result.validation_failure_message;
+    end if;
+
+    if (_create_form_question_set_result.created_form_question_set).form_question_set_type = 'conditional' then
+        _create_form_question_result := forms.create_form_question(
+            (_create_form_question_set_result.created_form_question_set).form_question_set_id,
+            'Untitled Question',
+            'radio',
+            1
+        );
+        if _create_form_question_result.validation_failure_message is not null then
+            raise exception 'Form Template Question Creation Failed'
+                using
+                    detail = 'Invalid Request Payload',
+                    hint = _create_form_question_result.validation_failure_message;
+        end if;
+
+        _create_form_question_settings_result := forms.create_form_question_settings(
+            jsonb_build_object(
+                'form_question_id', (_create_form_question_result.created_form_question).form_question_id,
+                'is_required', false
+            )
+        );
+
+        if _create_form_question_settings_result.validation_failure_message is not null then
+            raise exception 'Form Template Question Settings Creation Failed'
+                using
+                    detail = 'Invalid Request Payload',
+                    hint = _create_form_question_settings_result.validation_failure_message;
+        end if;
+
+        _create_form_question_options_result := forms.create_form_question_options(
+            (_create_form_question_result.created_form_question).form_question_id,
+            jsonb_build_array(
+                jsonb_build_object(
+                    'option_text', 'Option 1',
+                    'option_position', 1
+                ),
+                jsonb_build_object(
+                    'option_text', 'Option 2',
+                    'option_position', 2
+                )
+            )
+        );
+
+        if _create_form_question_options_result.validation_failure_message is not null then
+            raise exception 'Form Template Question Options Creation Failed'
+                using
+                    detail = 'Invalid Request Payload',
+                    hint = _create_form_question_options_result.validation_failure_message;
+        end if;
+
+        _create_form_question_default_option_result := forms.create_form_question_default_option(
+            (_create_form_question_result.created_form_question).form_question_id,
+            (_create_form_question_options_result.created_form_question_options[1]).form_question_option_id
+        );
+    end if;
+
+    return jsonb_build_object(
+        'form_question_sets', to_jsonb(forms.form_section_question_sets(form_section_id)),
+        'form_questions', to_jsonb(forms.form_section_questions(form_section_id))
+    );
+end;
+$$;
+
+grant execute on function api.create_form_template_question_set(bigint, forms.form_question_set_type, int, bigint, bigint) to authenticated;
 
 commit;

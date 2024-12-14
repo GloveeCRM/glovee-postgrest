@@ -52,6 +52,7 @@ drop function if exists forms.validate_update_form_question_settings_input(jsonb
 drop function if exists forms.update_form_question(jsonb);
 drop function if exists forms.validate_update_form_question_input(bigint, text, forms.form_question_type);
 drop function if exists forms.form_question_set_id_by_form_question_id(bigint);
+drop function if exists forms.form_section_questions(bigint);
 drop function if exists forms.form_question_position(bigint);
 drop function if exists forms.form_question_set_id_by_form_question_id(bigint);
 drop function if exists forms.form_id_by_form_question_id(bigint);
@@ -69,6 +70,7 @@ drop function if exists api.create_form_template_question_set(bigint, forms.form
 drop function if exists forms.create_form_question_set(bigint, forms.form_question_set_type, int, bigint, bigint);
 drop function if exists forms.form_id_by_form_section_id(bigint);
 drop function if exists forms.validate_create_form_question_set_input(bigint, forms.form_question_set_type, int, bigint, bigint);
+drop function if exists forms.form_section_question_sets(bigint);
 drop table if exists forms.form_question_settings;
 drop table if exists forms.form_question;
 drop domain if exists forms.form_question_type;
