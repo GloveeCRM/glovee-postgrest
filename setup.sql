@@ -4419,14 +4419,15 @@ end;
 $$;
 
 
-create or replace function forms.form_question_options(_form_question_id bigint) returns forms.form_question_option[]
+create or replace function forms.form_question_options(_form_question_id bigint) returns setof forms.form_question_option
     language sql
     stable
 as
 $$
-    select array_agg(fqo order by fqo.option_position)
+    select fqo.*
     from forms.form_question_option fqo
-    where fqo.form_question_id = _form_question_id;
+    where fqo.form_question_id = _form_question_id
+    order by fqo.option_position;
 $$;
 
 create table if not exists forms.form_question_default_option (
@@ -4696,6 +4697,8 @@ begin
                 detail = 'Invalid Request Payload',
                 hint = _update_form_question_result.validation_failure_message;
     end if;
+
+    _updated_form_section_questions := forms.form_section_questions(_target_form_section_id);
 
     return jsonb_build_object(
         'form_questions', _updated_form_section_questions
@@ -5267,4 +5270,256 @@ $$;
 
 grant execute on function api.create_form_template_question_set(bigint, forms.form_question_set_type, int, bigint, bigint) to authenticated;
 
+create or replace function forms.duplicate_form_question_option(_form_question_option forms.form_question_option, _new_form_question_id bigint) returns void
+    language plpgsql
+    security definer
+as
+$$
+begin
+    insert into forms.form_question_option (form_question_id, option_text, option_position)
+    values (_new_form_question_id, _form_question_option.option_text, _form_question_option.option_position);
+end;
+$$;
+
+create or replace function forms.duplicate_form_question_setting(_form_question_settings forms.form_question_settings, _new_form_question_id bigint) returns void
+    language plpgsql
+    security definer
+as
+$$
+begin
+    insert into forms.form_question_settings (form_question_id, helper_text, is_required, placeholder_text, minimum_length, maximum_length, minimum_date, maximum_date, display_type)
+    values (_new_form_question_id, _form_question_settings.helper_text, _form_question_settings.is_required, _form_question_settings.placeholder_text, _form_question_settings.minimum_length, _form_question_settings.maximum_length, _form_question_settings.minimum_date, _form_question_settings.maximum_date, _form_question_settings.display_type);
+end;
+$$;
+
+create or replace function forms.duplicate_form_question(_form_question forms.form_question, _new_form_question_set_id bigint) returns void
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _new_form_question_id bigint;
+    _form_question_option forms.form_question_option;
+    _form_question_settings forms.form_question_settings := forms.form_question_settings(_form_question.form_question_id);
+begin
+    insert into forms.form_question (form_question_set_id, form_question_prompt, form_question_type, form_question_position)
+    values (_new_form_question_set_id, _form_question.form_question_prompt, _form_question.form_question_type, _form_question.form_question_position)
+    returning form_question_id into _new_form_question_id;
+
+    for _form_question_option in select unnest(forms.form_question_options(_form_question.form_question_id)) loop
+        perform forms.duplicate_form_question_option(_form_question_option, _new_form_question_id);
+    end loop;
+
+    perform forms.duplicate_form_question_setting(_form_question_settings, _new_form_question_id);
+end;
+$$;
+
+create or replace function forms.form_question_set_questions(_form_question_set_id bigint) returns forms.form_question[]
+    language sql
+    stable
+as
+$$
+    select coalesce(array_agg(fq order by fq.form_question_position), array[]::forms.form_question[])
+    from forms.form_question fq
+    where fq.form_question_set_id = _form_question_set_id;
+$$;
+
+create or replace function forms.child_form_question_sets(_form_question_set_id bigint) returns forms.form_question_set[]
+    language sql
+    stable
+as
+$$
+    select coalesce(array_agg(fqs order by fqs.form_question_set_position), array[]::forms.form_question_set[])
+    from forms.form_question_set fqs
+    where fqs.parent_form_question_set_id = _form_question_set_id;
+$$;
+
+create or replace function forms.form_section_root_question_sets(_form_section_id bigint) returns forms.form_question_set[]
+    language sql
+    stable
+as
+$$
+    select coalesce(array_agg(fqs order by fqs.form_question_set_position), array[]::forms.form_question_set[])
+    from forms.form_question_set fqs
+    where fqs.form_section_id = _form_section_id
+    and fqs.parent_form_question_set_id is null;
+$$;
+
+create or replace function forms.duplicate_form_question_set(_form_question_set forms.form_question_set, _new_form_section_id bigint, _new_parent_form_question_set_id bigint) returns void
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _new_form_question_set_id bigint;
+    _form_question forms.form_question;
+    _child_form_question_set forms.form_question_set;
+begin
+    insert into forms.form_question_set (form_section_id, form_question_set_type, form_question_set_position, depends_on_option_id, parent_form_question_set_id)
+    values (_new_form_section_id, _form_question_set.form_question_set_type, _form_question_set.form_question_set_position, _form_question_set.depends_on_option_id, _new_parent_form_question_set_id)
+    returning form_question_set_id into _new_form_question_set_id;
+
+    for _form_question in select * from forms.form_question_set_questions(_form_question_set.form_question_set_id) loop
+        perform forms.duplicate_form_question(_form_question, _new_form_question_set_id);
+    end loop;
+
+    for _child_form_question_set in select * from forms.child_form_question_sets(_form_question_set.form_question_set_id) loop
+        perform forms.duplicate_form_question_set(_child_form_question_set, _new_form_section_id, _new_form_question_set_id);
+    end loop;
+end;
+$$;
+
+create or replace function forms.duplicate_form_section(_form_section forms.form_section, _new_form_category_id bigint) returns void
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _new_form_section_id bigint;
+    _form_question_set forms.form_question_set;
+begin
+    -- Create a new form section and all the question sets inside the existing section using
+    insert into forms.form_section (form_category_id, section_name, section_position)
+    values (_new_form_category_id, _form_section.section_name, _form_section.section_position)
+    returning form_section_id into _new_form_section_id;
+
+    -- duplicate_form_question_set
+    for _form_question_set in select * from forms.form_section_root_question_sets(_form_section.form_section_id) loop
+        perform forms.duplicate_form_question_set(_form_question_set, _new_form_section_id, null);
+    end loop;
+end;
+$$;
+
+create or replace function forms.form_category_sections(_form_category_id bigint) returns forms.form_section[]
+    language sql
+    stable
+as
+$$
+    select coalesce(array_agg(fs order by fs.section_position), array[]::forms.form_section[])
+    from forms.form_section fs
+    where fs.form_category_id = _form_category_id;
+$$;
+
+create or replace function forms.duplicate_form_category(_form_category forms.form_category, _new_form_id bigint) returns void
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _new_form_category_id bigint;
+    _form_section forms.form_section;
+begin
+    -- Create a new form category
+    insert into forms.form_category (form_id, category_name, category_position)
+    values (_new_form_id, _form_category.category_name, _form_category.category_position)
+    returning form_category_id into _new_form_category_id;
+
+    -- Create new sections for all the existing category's sections
+    for _form_section in select * from forms.form_category_sections(_form_category.form_category_id) loop
+        perform forms.duplicate_form_section(_form_section, _new_form_category_id);
+    end loop;
+end;
+$$;
+
+create or replace function forms.form_categories(_form_id bigint) returns forms.form_category[]
+    language sql
+    stable
+as
+$$
+    select coalesce(array_agg(fc order by fc.category_position), array[]::forms.form_category[])
+    from forms.form_category fc
+    where fc.form_id = _form_id;
+$$;
+
+create or replace function forms.duplicate_form(_form_id bigint, _created_by bigint) returns bigint
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _new_form_id bigint;
+    _form_category forms.form_category;
+begin
+    insert into forms.form (created_by)
+    values (_created_by)
+    returning form_id into _new_form_id;
+
+    for _form_category in select * from forms.form_categories(_form_id) loop
+        perform forms.duplicate_form_category(_form_category, _new_form_id);
+    end loop;
+
+    return _new_form_id;
+end;
+$$;
+
+
+create table if not exists forms.application_form(
+    application_form_id bigint default utils.generate_random_id() not null primary key,
+    organization_id bigint not null references organizations.organization(organization_id) on delete cascade,
+    form_id bigint not null references forms.form(form_id) on delete cascade,
+    created_by bigint references users.user(user_id) on delete set null,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now()
+)
+
+create or replace function forms.create_application_form(_organization_id bigint, _form_id bigint, _created_by bigint) returns bigint
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _application_form_id bigint;
+begin
+    insert into forms.application_form (organization_id, form_id, created_by)
+    values (_organization_id, _form_id, _created_by)
+    returning application_form_id into _application_form_id;
+
+    return _application_form_id;
+end;
+$$;
+
+create or replace function api.create_application_form(form_template_id bigint) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_user_role users.user_role := auth.current_user_role();
+    _existing_form_id bigint := forms.form_id_by_form_template_id(form_template_id);
+    _new_form_id bigint;
+    _application_form_id bigint;
+begin
+    if _current_user_role not in ('org_admin', 'org_owner') then
+        raise exception 'Form Creation Failed'
+            using
+                detail = 'You are not authorized to create a form',
+                hint = 'unauthorized';
+    end if;
+
+    if _existing_form_id is null then
+        raise exception 'Form Creation Failed'
+            using
+                detail = 'The form template was not found',
+                hint = 'form_template_not_found';
+    end if;
+
+    _new_form_id := forms.duplicate_form(
+        _existing_form_id,
+        auth.current_user_id()
+    );
+
+    _application_form_id := forms.create_application_form(
+        auth.current_user_organization_id(),
+        _new_form_id,
+        auth.current_user_id()
+    );
+
+    return jsonb_build_object(
+        'form_id', _new_form_id,
+        'application_form_id', _application_form_id
+    );
+end;
+$$;
+
+grant execute on function api.create_application_form(bigint) to authenticated;
 commit;
