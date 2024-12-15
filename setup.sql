@@ -5452,8 +5452,7 @@ begin
 end;
 $$;
 
-
-create table if not exists forms.application_form(
+create table if not exists applications.application_form(
     application_form_id bigint default utils.generate_random_id() not null primary key,
     organization_id bigint not null references organizations.organization(organization_id) on delete cascade,
     application_id bigint not null references applications.application(application_id) on delete cascade,
@@ -5461,9 +5460,9 @@ create table if not exists forms.application_form(
     created_by bigint references users.user(user_id) on delete set null,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
-)
+);
 
-create or replace function forms.create_application_form(_organization_id bigint, _application_id bigint, _form_id bigint, _created_by bigint) returns bigint
+create or replace function applications.create_application_form(_organization_id bigint, _application_id bigint, _form_id bigint, _created_by bigint) returns bigint
     language plpgsql
     security definer
 as
@@ -5471,7 +5470,7 @@ $$
 declare
     _application_form_id bigint;
 begin
-    insert into forms.application_form (organization_id, application_id, form_id, created_by)
+    insert into applications.application_form (organization_id, application_id, form_id, created_by)
     values (_organization_id, _application_id, _form_id, _created_by)
     returning application_form_id into _application_form_id;
 
@@ -5489,6 +5488,7 @@ declare
     _existing_form_id bigint := forms.form_id_by_form_template_id(form_template_id);
     _new_form_id bigint;
     _application_form_id bigint;
+    _create_application_update_result record;
 begin
     if _current_user_role not in ('org_admin', 'org_owner') then
         raise exception 'Form Creation Failed'
@@ -5509,20 +5509,61 @@ begin
         auth.current_user_id()
     );
 
-    _application_form_id := forms.create_application_form(
+    _application_form_id := applications.create_application_form(
         auth.current_user_organization_id(),
         application_id,
         _new_form_id,
         auth.current_user_id()
     );
 
+    _create_application_update_result := applications.create_application_update(
+        application_id,
+        'new_form_added',
+        auth.current_user_id(),
+        null,
+        null
+    );
+
     return jsonb_build_object(
-        'form_id', _new_form_id,
         'application_form_id', _application_form_id
     );
 end;
 $$;
 
 grant execute on function api.create_application_form(bigint, bigint) to authenticated;
+
+create or replace function api.application_forms(application_id bigint) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_user_role users.user_role := auth.current_user_role();
+    _application_forms jsonb;
+begin
+    if (_current_user_role = 'org_client' and applications.application_user_id(application_id) != auth.current_user_id())
+    or _current_user_role not in ('org_admin', 'org_owner', 'org_client') then
+        raise exception 'Application Forms Retrieval Failed'
+            using
+                detail = 'You are not authorized to retrieve application forms',
+                hint = 'unauthorized';
+    end if;
+
+    select jsonb_agg(
+        to_jsonb(af) || jsonb_build_object(
+            'form', to_jsonb(f)
+        )
+    )
+    into _application_forms
+    from applications.application_form af
+    join forms.form f on f.form_id = af.form_id
+    where af.application_id = $1
+    and af.organization_id = auth.current_user_organization_id();
+
+    return _application_forms;
+end;
+$$;
+
+grant execute on function api.application_forms(bigint) to authenticated;
 
 commit;

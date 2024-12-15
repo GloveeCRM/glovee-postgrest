@@ -26,9 +26,10 @@ end$$;
 begin;
 
 -- Drop Forms
-drop function if exists api.create_application_form(bigint);
-drop function if exists forms.create_application_form(bigint, bigint, bigint);
-drop table if exists forms.application_form;
+drop function if exists api.application_forms(bigint);
+drop function if exists api.create_application_form(bigint, bigint);
+drop function if exists applications.create_application_form(bigint, bigint, bigint, bigint);
+drop table if exists applications.application_form;
 drop function if exists forms.duplicate_form(bigint, bigint);
 drop function if exists forms.form_categories(bigint);
 drop function if exists forms.duplicate_form_category(forms.form_category, bigint);
