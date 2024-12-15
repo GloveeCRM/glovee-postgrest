@@ -5456,13 +5456,14 @@ $$;
 create table if not exists forms.application_form(
     application_form_id bigint default utils.generate_random_id() not null primary key,
     organization_id bigint not null references organizations.organization(organization_id) on delete cascade,
+    application_id bigint not null references applications.application(application_id) on delete cascade,
     form_id bigint not null references forms.form(form_id) on delete cascade,
     created_by bigint references users.user(user_id) on delete set null,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
 )
 
-create or replace function forms.create_application_form(_organization_id bigint, _form_id bigint, _created_by bigint) returns bigint
+create or replace function forms.create_application_form(_organization_id bigint, _application_id bigint, _form_id bigint, _created_by bigint) returns bigint
     language plpgsql
     security definer
 as
@@ -5470,15 +5471,15 @@ $$
 declare
     _application_form_id bigint;
 begin
-    insert into forms.application_form (organization_id, form_id, created_by)
-    values (_organization_id, _form_id, _created_by)
+    insert into forms.application_form (organization_id, application_id, form_id, created_by)
+    values (_organization_id, _application_id, _form_id, _created_by)
     returning application_form_id into _application_form_id;
 
     return _application_form_id;
 end;
 $$;
 
-create or replace function api.create_application_form(form_template_id bigint) returns jsonb
+create or replace function api.create_application_form(application_id bigint, form_template_id bigint) returns jsonb
     language plpgsql
     security definer
 as
@@ -5510,6 +5511,7 @@ begin
 
     _application_form_id := forms.create_application_form(
         auth.current_user_organization_id(),
+        application_id,
         _new_form_id,
         auth.current_user_id()
     );
@@ -5521,5 +5523,6 @@ begin
 end;
 $$;
 
-grant execute on function api.create_application_form(bigint) to authenticated;
+grant execute on function api.create_application_form(bigint, bigint) to authenticated;
+
 commit;
