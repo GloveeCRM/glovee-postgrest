@@ -26,6 +26,8 @@ end$$;
 begin;
 
 -- Drop Forms
+drop function if exists api.application_form_categories_and_sections(bigint);
+drop function if exists applications.application_form_owner_id(bigint);
 drop function if exists api.application_forms(bigint);
 drop function if exists api.create_application_form(bigint, bigint);
 drop function if exists applications.create_application_form(bigint, bigint, bigint, bigint);

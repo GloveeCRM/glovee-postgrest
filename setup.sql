@@ -5566,4 +5566,82 @@ $$;
 
 grant execute on function api.application_forms(bigint) to authenticated;
 
+create or replace function applications.application_form_owner_id(_application_form_id bigint) returns bigint
+    language sql
+    stable
+as
+$$
+    select
+        a.user_id
+    from applications.application a
+    join applications.application_form af
+    using (application_id)
+    where af.application_form_id = _application_form_id;
+$$;
+
+create or replace function api.application_form_categories_and_sections(application_form_id bigint) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_user_role users.user_role := auth.current_user_role();
+    _application_form applications.application_form;
+    _form forms.form;
+    _application_form_categories jsonb;
+    _application_form_sections jsonb;
+begin
+    if (_current_user_role = 'org_client' and applications.application_form_owner_id(application_form_id) != auth.current_user_id())
+    or _current_user_role not in ('org_admin', 'org_owner', 'org_client') then
+        raise exception 'Application Forms Retrieval Failed'
+            using
+                detail = 'You are not authorized to retrieve application forms',
+                hint = 'unauthorized';
+    end if;
+
+    select *
+    into _application_form
+    from applications.application_form af
+    where af.application_form_id = $1
+    and organization_id = auth.current_user_organization_id();
+
+    select *
+    into _form
+    from forms.form
+    where form_id = _application_form.form_id;
+
+    -- Select form categories with completion_rate
+    select jsonb_agg(
+        to_jsonb(fc) || jsonb_build_object('completion_rate', 0)
+        order by fc.category_position
+    )
+    into _application_form_categories
+    from forms.form_category fc
+    where fc.form_id = _application_form.form_id;
+
+    -- Select form sections with completion_rate
+    select jsonb_agg(
+        to_jsonb(fs) || jsonb_build_object('completion_rate', 0)
+        order by fs.section_position
+    )
+    into _application_form_sections
+    from forms.form_section fs
+    where fs.form_category_id = any(
+        select form_category_id
+        from forms.form_category
+        where form_id = _application_form.form_id
+    );
+
+    return jsonb_build_object(
+        'application_form', to_jsonb(_application_form) || jsonb_build_object(
+            'form', to_jsonb(_form)
+        ),
+        'form_categories', coalesce(_application_form_categories, '[]'::jsonb),
+        'form_sections', coalesce(_application_form_sections, '[]'::jsonb)
+    );
+end;
+$$;
+
+grant execute on function api.application_form_categories_and_sections(bigint) to authenticated;
+
 commit;
