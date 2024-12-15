@@ -5644,4 +5644,45 @@ $$;
 
 grant execute on function api.application_form_categories_and_sections(bigint) to authenticated;
 
+create or replace function forms.form_section_application_form_id(form_section_id bigint) returns bigint
+    language sql
+    stable
+as
+$$
+    select af.application_form_id
+    from applications.application_form af
+    join forms.form_category fc
+    using (form_id)
+    join forms.form_section fs
+    using (form_category_id)
+    where fs.form_section_id = $1;
+$$;
+
+
+create or replace function api.application_form_section_question_sets_and_questions(form_section_id bigint) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_user_role users.user_role := auth.current_user_role();
+    _application_form_id bigint := forms.form_section_application_form_id(form_section_id);
+begin
+    if (_current_user_role = 'org_client' and applications.application_form_owner_id(_application_form_id) != auth.current_user_id())
+    or _current_user_role not in ('org_admin', 'org_owner', 'org_client') then
+        raise exception 'Form Template Section Question Sets And Questions Retrieval Failed'
+            using
+                detail = 'You are not authorized to retrieve the form template section question sets and questions',
+                hint = 'unauthorized';
+    end if;
+
+    return jsonb_build_object(
+        'form_question_sets', to_jsonb(forms.form_section_question_sets(form_section_id)),
+        'form_questions', forms.form_section_questions(form_section_id)
+    );
+end;
+$$;
+
+grant execute on function api.application_form_section_question_sets_and_questions(bigint) to authenticated;
+
 commit;
