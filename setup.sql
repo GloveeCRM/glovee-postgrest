@@ -5685,4 +5685,110 @@ $$;
 
 grant execute on function api.application_form_section_question_sets_and_questions(bigint) to authenticated;
 
+create table if not exists forms.form_answer(
+    form_answer_id bigint default utils.generate_random_id() not null primary key,
+    form_question_id bigint not null unique references forms.form_question(form_question_id) on delete cascade,
+    answer_text text,
+    answer_date date,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now()
+);
+
+create or replace function forms.validate_upsert_form_answer_input(
+    _form_question_id bigint
+) returns text
+    language plpgsql
+    security definer
+as
+$$
+begin
+    if _form_question_id is null or _form_question_id = 0 then
+        return 'form_question_id_required';
+    end if;
+
+    if not exists (
+        select 1
+        from forms.form_question fq
+        where fq.form_question_id = _form_question_id
+    ) then
+        return 'form_question_not_found';
+    end if;
+
+    return null;
+end;
+$$;
+
+create or replace function forms.upsert_form_answer(
+    _form_question_id bigint,
+    _answer_text text default null,
+    _answer_date date default null,
+    out upserted_form_answer forms.form_answer,
+    out validation_failure_message text
+) returns record
+    language plpgsql
+    security definer
+as
+$$
+begin
+    validation_failure_message := forms.validate_upsert_form_answer_input(_form_question_id);
+    if validation_failure_message is not null then
+        return;
+    end if;
+
+    insert into forms.form_answer (
+        form_question_id, 
+        answer_text, 
+        answer_date
+    ) values (
+        _form_question_id, 
+        _answer_text, 
+        _answer_date
+    )
+    on conflict (form_question_id) do update 
+    set 
+        answer_text = excluded.answer_text,
+        answer_date = excluded.answer_date,
+        updated_at = now()
+    returning * into upserted_form_answer;
+end;
+$$;
+
+create or replace function api.upsert_form_answer(
+    form_question_id bigint,
+    answer_text text default null,
+    answer_date date default null
+) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_user_role users.user_role := auth.current_user_role();
+    _upsert_form_answer_result record;
+begin
+    if _current_user_role != 'org_client' then
+        raise exception 'Form Answer Upsert Failed'
+            using
+                detail = 'You are not authorized to upsert form answers',
+                hint = 'unauthorized';
+    end if;
+
+    _upsert_form_answer_result := forms.upsert_form_answer(
+        form_question_id,
+        answer_text,
+        answer_date
+    );
+    if _upsert_form_answer_result.validation_failure_message is not null then
+        raise exception 'Form Answer Upsert Failed'
+            using
+                detail = 'Validation failed',
+                hint = _upsert_form_answer_result.validation_failure_message;
+    end if;
+
+    return to_jsonb(_upsert_form_answer_result.upserted_form_answer);
+end;
+$$;
+
+grant execute on function api.upsert_form_answer(bigint, text, date) to authenticated;
+
 commit;
