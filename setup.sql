@@ -5694,6 +5694,78 @@ create table if not exists forms.form_answer(
     updated_at timestamptz not null default now()
 );
 
+create table if not exists forms.form_answer_file(
+    form_answer_id bigint not null references forms.form_answer(form_answer_id) on delete cascade,
+    file_id bigint not null references files.file(file_id) on delete cascade,
+    created_at timestamptz not null default now()
+);
+
+create or replace function forms.validate_create_form_answer_file_input(
+    _form_answer_id bigint,
+    _file_id bigint
+) returns text
+    language plpgsql
+as
+$$
+begin
+    if _form_answer_id is null or _form_answer_id <= 0 then
+        return 'missing_form_answer_id';
+    end if;
+
+    if _file_id is null or _file_id <= 0 then
+        return 'missing_file_id';
+    end if;
+
+    if not exists (
+        select 1
+        from forms.form_answer fa
+        where fa.form_answer_id = _form_answer_id
+    ) then
+        return 'form_answer_not_found';
+    end if;
+
+    if not exists (
+        select 1
+        from files.file f
+        where f.file_id = _file_id
+        and f.organization_id = auth.current_user_organization_id()
+    ) then
+        return 'file_not_found';
+    end if;
+
+    return null;
+end;
+$$;
+
+create or replace function forms.create_form_answer_file(
+    _form_answer_id bigint,
+    _file_id bigint,
+    out validation_failure_message text,
+    out created_form_answer_file forms.form_answer_file
+) returns record
+    language plpgsql
+    security definer
+as
+$$
+begin
+    validation_failure_message := forms.validate_create_form_answer_file_input(_form_answer_id, _file_id);
+    if validation_failure_message is not null then
+        return;
+    end if;
+
+    insert into forms.form_answer_file (
+        form_answer_id,
+        file_id
+    ) values (
+        _form_answer_id,
+        _file_id
+    )
+    returning * into created_form_answer_file;
+
+    return;
+end;
+$$;
+
 create or replace function forms.validate_upsert_form_answer_input(
     _form_question_id bigint
 ) returns text
@@ -5756,7 +5828,8 @@ $$;
 create or replace function api.upsert_form_answer(
     form_question_id bigint,
     answer_text text default null,
-    answer_date date default null
+    answer_date date default null,
+    form_answer_files jsonb default null
 ) returns jsonb
     language plpgsql
     security definer
@@ -5764,7 +5837,16 @@ as
 $$
 declare
     _current_user_role users.user_role := auth.current_user_role();
+    _current_user_org_id bigint := auth.current_user_organization_id();
+    _current_user_id bigint := auth.current_user_id();
+    _user_org_config organizations.organization_config;
     _upsert_form_answer_result record;
+    _create_file_result record;
+    _create_form_answer_file_result record;
+    _form_answer_file jsonb;
+    _existing_file_ids bigint[];
+    _input_file_ids bigint[];
+    _file_ids_to_delete bigint[];
 begin
     if _current_user_role != 'org_client' then
         raise exception 'Form Answer Upsert Failed'
@@ -5785,10 +5867,126 @@ begin
                 hint = _upsert_form_answer_result.validation_failure_message;
     end if;
 
-    return to_jsonb(_upsert_form_answer_result.upserted_form_answer);
+    select array_agg(file_id)
+    into _existing_file_ids
+    from forms.form_answer_file
+    where form_answer_id = (_upsert_form_answer_result.upserted_form_answer).form_answer_id;
+
+    select array_agg((file->>'file_id')::bigint)
+    into _input_file_ids
+    from jsonb_array_elements(form_answer_files) as file
+    where file->>'file_id' is not null;
+
+    _existing_file_ids := coalesce(_existing_file_ids, array[]::bigint[]);
+    _input_file_ids := coalesce(_input_file_ids, array[]::bigint[]);
+
+    select array_agg(file_id)
+    into _file_ids_to_delete
+    from (
+        select unnest(_existing_file_ids) as file_id
+        except
+        select unnest(_input_file_ids)
+    ) as files_to_remove;
+
+    -- Delete only files that are no longer in input
+    if _file_ids_to_delete is not null then
+        delete from files.file f
+        where f.file_id = any(_file_ids_to_delete);
+    end if;
+
+    if form_answer_files is not null and jsonb_array_length(form_answer_files) > 0 then
+        _user_org_config := organizations.config_by_org_id(_current_user_org_id);
+
+        for _form_answer_file in select * from jsonb_array_elements(form_answer_files)
+        loop
+            if (_form_answer_file->>'file_id') is null then
+                -- Create new file
+                _create_file_result := files.create_file(
+                    (_form_answer_file->>'object_key')::text,
+                    (_form_answer_file->>'file_name')::text,
+                    _user_org_config.s3_bucket,
+                    _user_org_config.s3_region,
+                    (_form_answer_file->>'mime_type')::text,
+                    (_form_answer_file->>'size')::bigint,
+                    _current_user_org_id,
+                    _current_user_id,
+                    (_form_answer_file->'metadata')::jsonb
+                );
+                if _create_file_result.validation_failure_message is not null then
+                    raise exception 'Form Answer File Creation Failed'
+                        using
+                            detail = 'Validation failed',
+                            hint = _create_file_result.validation_failure_message;
+                end if;
+
+                -- Create form_answer_file association for new file
+                _create_form_answer_file_result := forms.create_form_answer_file(
+                    (_upsert_form_answer_result.upserted_form_answer).form_answer_id,
+                    (_create_file_result.created_file).file_id
+                );
+                if _create_form_answer_file_result.validation_failure_message is not null then
+                    raise exception 'Form Answer File Association Failed'
+                        using
+                            detail = 'Validation failed',
+                            hint = _create_form_answer_file_result.validation_failure_message;
+                end if;
+            end if;
+        end loop;
+    end if;
+
+    return to_jsonb(
+        _upsert_form_answer_result.upserted_form_answer
+    );
 end;
 $$;
 
-grant execute on function api.upsert_form_answer(bigint, text, date) to authenticated;
+grant execute on function api.upsert_form_answer(bigint, text, date, jsonb) to authenticated;
+
+create or replace function api.form_answer_file_upload_url(
+    form_question_id bigint,
+    file_name text,
+    mime_type text
+) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_org_id bigint := auth.current_user_organization_id();
+    _current_user_role users.user_role := auth.current_user_role();
+    _org_config organizations.organization_config;
+    _object_key text;
+begin
+    if _current_user_role != 'org_client' then
+        raise exception 'Form Answer File Upload URL Failed'
+            using
+                detail = 'You are not authorized to create a form answer file upload URL',
+                hint = 'unauthorized';
+    end if;
+
+    _object_key := files.generate_object_key(
+        _current_org_id,
+        'form_answer_file',
+        mime_type,
+        file_name,
+        form_question_id
+    );
+
+    _org_config := organizations.config_by_org_id(_current_org_id);
+
+    return jsonb_build_object(
+        'url', aws.generate_s3_presigned_url(
+            _org_config.s3_bucket,
+            _object_key,
+            _org_config.s3_region,
+            'PUT',
+            3600
+        ),
+        'object_key', _object_key
+    );
+end;
+$$;
+
+grant execute on function api.form_answer_file_upload_url(bigint, text, text) to authenticated;
 
 commit;

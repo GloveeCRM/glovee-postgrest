@@ -26,9 +26,13 @@ end$$;
 begin;
 
 -- Drop Forms
-drop function if exists api.upsert_form_answer(bigint, text, date);
+drop function if exists api.form_answer_file_upload_url(bigint, text, text);
+drop function if exists api.upsert_form_answer(bigint, text, date, jsonb);
 drop function if exists forms.upsert_form_answer(bigint, text, date);
 drop function if exists forms.validate_upsert_form_answer_input(bigint);
+drop function if exists forms.create_form_answer_file(bigint, bigint);
+drop function if exists forms.validate_create_form_answer_file_input(bigint, bigint);
+drop table if exists forms.form_answer_file;
 drop table if exists forms.form_answer;
 drop function if exists api.application_form_section_question_sets_and_questions(bigint);
 drop function if exists forms.form_section_application_form_id(bigint);
