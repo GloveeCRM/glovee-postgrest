@@ -5829,7 +5829,7 @@ create or replace function api.upsert_form_answer(
     form_question_id bigint,
     answer_text text default null,
     answer_date date default null,
-    form_answer_files jsonb default null
+    answer_files jsonb default null
 ) returns jsonb
     language plpgsql
     security definer
@@ -5843,7 +5843,7 @@ declare
     _upsert_form_answer_result record;
     _create_file_result record;
     _create_form_answer_file_result record;
-    _form_answer_file jsonb;
+    _answer_file jsonb;
     _existing_file_ids bigint[];
     _input_file_ids bigint[];
     _file_ids_to_delete bigint[];
@@ -5872,10 +5872,10 @@ begin
     from forms.form_answer_file
     where form_answer_id = (_upsert_form_answer_result.upserted_form_answer).form_answer_id;
 
-    select array_agg((file->>'file_id')::bigint)
+    select array_agg((answer_file->'file'->>'fileID')::bigint)
     into _input_file_ids
-    from jsonb_array_elements(form_answer_files) as file
-    where file->>'file_id' is not null;
+    from jsonb_array_elements(answer_files) as answer_file
+    where answer_file->'file'->>'fileID' is not null;
 
     _existing_file_ids := coalesce(_existing_file_ids, array[]::bigint[]);
     _input_file_ids := coalesce(_input_file_ids, array[]::bigint[]);
@@ -5888,29 +5888,27 @@ begin
         select unnest(_input_file_ids)
     ) as files_to_remove;
 
-    -- Delete only files that are no longer in input
     if _file_ids_to_delete is not null then
         delete from files.file f
         where f.file_id = any(_file_ids_to_delete);
     end if;
 
-    if form_answer_files is not null and jsonb_array_length(form_answer_files) > 0 then
+    if answer_files is not null and jsonb_array_length(answer_files) > 0 then
         _user_org_config := organizations.config_by_org_id(_current_user_org_id);
 
-        for _form_answer_file in select * from jsonb_array_elements(form_answer_files)
+        for _answer_file in select * from jsonb_array_elements(answer_files)
         loop
-            if (_form_answer_file->>'file_id') is null then
-                -- Create new file
+            if (_answer_file->'file'->>'fileID') is null then
                 _create_file_result := files.create_file(
-                    (_form_answer_file->>'object_key')::text,
-                    (_form_answer_file->>'file_name')::text,
+                    (_answer_file->'file'->>'object_key')::text,
+                    (_answer_file->'file'->>'name')::text,
                     _user_org_config.s3_bucket,
                     _user_org_config.s3_region,
-                    (_form_answer_file->>'mime_type')::text,
-                    (_form_answer_file->>'size')::bigint,
+                    (_answer_file->'file'->>'mime_type')::text,
+                    (_answer_file->'file'->>'size')::bigint,
                     _current_user_org_id,
                     _current_user_id,
-                    (_form_answer_file->'metadata')::jsonb
+                    (_answer_file->'file'->'metadata')::jsonb
                 );
                 if _create_file_result.validation_failure_message is not null then
                     raise exception 'Form Answer File Creation Failed'
@@ -5919,7 +5917,6 @@ begin
                             hint = _create_file_result.validation_failure_message;
                 end if;
 
-                -- Create form_answer_file association for new file
                 _create_form_answer_file_result := forms.create_form_answer_file(
                     (_upsert_form_answer_result.upserted_form_answer).form_answer_id,
                     (_create_file_result.created_file).file_id
