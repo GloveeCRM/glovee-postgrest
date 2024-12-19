@@ -2259,7 +2259,7 @@ declare
     _application_files jsonb;
 begin
     if (_current_user_role = 'org_client' and applications.application_user_id($1) != _current_user_id)
-    or (_current_user_role in ('org_admin', 'org_owner') and applications.application_organization_id($1) != _current_user_org_id then
+    or (_current_user_role in ('org_admin', 'org_owner') and applications.application_organization_id($1) != _current_user_org_id) then
         raise exception 'Application Files Retrieval Failed'
             using
                 detail = 'You are not authorized to retrieve the application files for this application',
@@ -4080,7 +4080,7 @@ $$
     where fq.form_question_id = _form_question_id;
 $$;
 
-create or replace function forms.form_section_questions(_form_section_id bigint) returns jsonb
+create or replace function forms.form_section_questions(_form_section_id bigint, _include_answers boolean default false) returns jsonb
     language plpgsql
     stable
 as
@@ -4091,16 +4091,24 @@ begin
     select jsonb_agg(
         to_jsonb(fq) || jsonb_build_object(
             'form_question_settings', to_jsonb(forms.form_question_settings(fq.form_question_id)),
-            'form_question_options', to_jsonb(forms.form_question_options(fq.form_question_id)),
+            'form_question_options', (
+                select jsonb_agg(to_jsonb(options))
+                from forms.form_question_options(fq.form_question_id) as options
+            ),
             'form_question_default_options', to_jsonb(forms.form_question_default_options(fq.form_question_id))
-        )
+        ) || case 
+            when _include_answers then jsonb_build_object(
+                'answer', forms.form_question_answer(fq.form_question_id)
+            )
+            else '{}'::jsonb
+        end
         order by fq.form_question_position
     ) into _form_section_questions
     from forms.form_question fq
-    join forms.form_question_set fqs on fq.form_question_set_id = fqs.form_question_set_id
+    join forms.form_question_set fqs using (form_question_set_id)
     where fqs.form_section_id = _form_section_id;
 
-    return _form_section_questions;
+    return coalesce(_form_section_questions, '[]'::jsonb);
 end;
 $$;
 
@@ -5659,7 +5667,7 @@ $$
 $$;
 
 
-create or replace function api.application_form_section_question_sets_and_questions(form_section_id bigint) returns jsonb
+create or replace function api.application_form_section_question_sets_and_questions(form_section_id bigint, include_answers boolean default false) returns jsonb
     language plpgsql
     security definer
 as
@@ -5678,12 +5686,12 @@ begin
 
     return jsonb_build_object(
         'form_question_sets', to_jsonb(forms.form_section_question_sets(form_section_id)),
-        'form_questions', forms.form_section_questions(form_section_id)
+        'form_questions', forms.form_section_questions(form_section_id, include_answers)
     );
 end;
 $$;
 
-grant execute on function api.application_form_section_question_sets_and_questions(bigint) to authenticated;
+grant execute on function api.application_form_section_question_sets_and_questions(bigint, boolean) to authenticated;
 
 create table if not exists forms.form_answer(
     form_answer_id bigint default utils.generate_random_id() not null primary key,
@@ -5699,6 +5707,126 @@ create table if not exists forms.form_answer_file(
     file_id bigint not null references files.file(file_id) on delete cascade,
     created_at timestamptz not null default now()
 );
+
+create table if not exists forms.form_answer_option(
+    form_answer_id bigint not null references forms.form_answer(form_answer_id) on delete cascade,
+    form_question_option_id bigint not null references forms.form_question_option(form_question_option_id) on delete cascade,
+    created_at timestamptz not null default now()
+);
+
+create or replace function forms.form_question_answer(_form_question_id bigint) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _organization_config organizations.organization_config;
+begin
+    _organization_config := organizations.config_by_org_id(auth.current_user_organization_id());
+
+    return (
+        select to_jsonb(fa) || jsonb_build_object(
+            'answer_options', coalesce((
+                select jsonb_agg(to_jsonb(fao))
+                from forms.form_answer_option fao
+                where fao.form_answer_id = fa.form_answer_id
+            ), '[]'::jsonb),
+            'answer_files', coalesce((
+                select jsonb_agg(to_jsonb(af) || jsonb_build_object(
+                    'file', jsonb_build_object(
+                        'file_id', f.file_id,
+                        'name', f.name,
+                        'mime_type', f.mime_type,
+                        'size', f.size,
+                        'url', aws.generate_s3_presigned_url(
+                            _organization_config.s3_bucket,
+                            f.object_key,
+                            _organization_config.s3_region,
+                            'GET',
+                            3600
+                        ),
+                        'created_at', f.created_at,
+                        'updated_at', f.updated_at
+                    )
+                ))
+                from forms.form_answer_file af
+                join files.file f using (file_id)
+                where af.form_answer_id = fa.form_answer_id
+            ), '[]'::jsonb)
+        )
+        from forms.form_answer fa
+        where fa.form_question_id = _form_question_id
+    );
+end;
+$$;
+
+create or replace function forms.validate_create_form_answer_option_input(
+    _form_answer_id bigint,
+    _form_question_option_id bigint
+) returns text
+    language plpgsql
+    security definer
+as
+$$
+begin
+    if _form_answer_id is null or _form_answer_id <= 0 then
+        return 'missing_form_answer_id';
+    end if;
+
+    if _form_question_option_id is null or _form_question_option_id <= 0 then
+        return 'missing_form_question_option_id';
+    end if;
+
+    if not exists (
+        select 1
+        from forms.form_answer fa
+        where fa.form_answer_id = _form_answer_id
+    ) then
+        return 'form_answer_not_found';
+    end if;
+
+    if not exists (
+        select 1
+        from forms.form_question_option fqo
+        join forms.form_answer fa
+        using (form_question_id)
+        where fqo.form_question_option_id = _form_question_option_id
+    ) then
+        return 'form_question_option_not_found';
+    end if;
+
+    return null;
+end;
+$$;
+
+create or replace function forms.create_form_answer_option(
+    _form_answer_id bigint,
+    _form_question_option_id bigint,
+    out validation_failure_message text,
+    out created_form_answer_option forms.form_answer_option
+) returns record
+    language plpgsql
+    security definer
+as
+$$
+begin
+    validation_failure_message := forms.validate_create_form_answer_option_input(_form_answer_id, _form_question_option_id);
+    if validation_failure_message is not null then
+        return;
+    end if;
+
+    insert into forms.form_answer_option (
+        form_answer_id,
+        form_question_option_id
+    ) values (
+        _form_answer_id,
+        _form_question_option_id
+    )
+    returning * into created_form_answer_option;
+
+    return;
+end;
+$$;
 
 create or replace function forms.validate_create_form_answer_file_input(
     _form_answer_id bigint,
@@ -5829,7 +5957,8 @@ create or replace function api.upsert_form_answer(
     form_question_id bigint,
     answer_text text default null,
     answer_date date default null,
-    answer_files jsonb default null
+    answer_files jsonb default null,
+    answer_options jsonb default null
 ) returns jsonb
     language plpgsql
     security definer
@@ -5843,10 +5972,16 @@ declare
     _upsert_form_answer_result record;
     _create_file_result record;
     _create_form_answer_file_result record;
+    _create_form_answer_option_result record;
     _answer_file jsonb;
+    _answer_option jsonb;
     _existing_file_ids bigint[];
     _input_file_ids bigint[];
     _file_ids_to_delete bigint[];
+    _existing_option_ids bigint[];
+    _input_option_ids bigint[];
+    _option_ids_to_delete bigint[];
+    _updated_form_answer jsonb;
 begin
     if _current_user_role != 'org_client' then
         raise exception 'Form Answer Upsert Failed'
@@ -5867,15 +6002,16 @@ begin
                 hint = _upsert_form_answer_result.validation_failure_message;
     end if;
 
+    -- Handle files
     select array_agg(file_id)
     into _existing_file_ids
     from forms.form_answer_file
     where form_answer_id = (_upsert_form_answer_result.upserted_form_answer).form_answer_id;
 
-    select array_agg((answer_file->'file'->>'fileID')::bigint)
+    select array_agg((answer_file->'file'->>'file_id')::bigint)
     into _input_file_ids
     from jsonb_array_elements(answer_files) as answer_file
-    where answer_file->'file'->>'fileID' is not null;
+    where answer_file->'file'->>'file_id' is not null;
 
     _existing_file_ids := coalesce(_existing_file_ids, array[]::bigint[]);
     _input_file_ids := coalesce(_input_file_ids, array[]::bigint[]);
@@ -5898,7 +6034,7 @@ begin
 
         for _answer_file in select * from jsonb_array_elements(answer_files)
         loop
-            if (_answer_file->'file'->>'fileID') is null then
+            if (_answer_file->'file'->>'file_id') is null then
                 _create_file_result := files.create_file(
                     (_answer_file->'file'->>'object_key')::text,
                     (_answer_file->'file'->>'name')::text,
@@ -5931,13 +6067,61 @@ begin
         end loop;
     end if;
 
-    return to_jsonb(
-        _upsert_form_answer_result.upserted_form_answer
+    -- Handle options
+    select array_agg(form_question_option_id)
+    into _existing_option_ids
+    from forms.form_answer_option
+    where form_answer_id = (_upsert_form_answer_result.upserted_form_answer).form_answer_id;
+
+    select array_agg((answer_option->>'form_question_option_id')::bigint)
+    into _input_option_ids
+    from jsonb_array_elements(answer_options) as answer_option
+    where answer_option->>'form_question_option_id' is not null;
+
+    _existing_option_ids := coalesce(_existing_option_ids, array[]::bigint[]);
+    _input_option_ids := coalesce(_input_option_ids, array[]::bigint[]);
+
+    select array_agg(option_id)
+    into _option_ids_to_delete
+    from (
+        select unnest(_existing_option_ids) as option_id
+        except
+        select unnest(_input_option_ids)
+    ) as options_to_remove;
+
+    if _option_ids_to_delete is not null then
+        delete from forms.form_answer_option
+        where form_answer_id = (_upsert_form_answer_result.upserted_form_answer).form_answer_id
+        and form_question_option_id = any(_option_ids_to_delete);
+    end if;
+
+    if answer_options is not null and jsonb_array_length(answer_options) > 0 then
+        for _answer_option in select * from jsonb_array_elements(answer_options)
+        loop
+            if not (_answer_option->>'form_question_option_id')::bigint = any(_existing_option_ids) then
+                _create_form_answer_option_result := forms.create_form_answer_option(
+                    (_upsert_form_answer_result.upserted_form_answer).form_answer_id,
+                    (_answer_option->>'form_question_option_id')::bigint
+                );
+                if _create_form_answer_option_result.validation_failure_message is not null then
+                    raise exception 'Form Answer Option Creation Failed'
+                        using
+                            detail = 'Validation failed',
+                            hint = _create_form_answer_option_result.validation_failure_message;
+                end if;
+            end if;
+        end loop;
+    end if;
+
+    _updated_form_answer := forms.form_question_answer(form_question_id);
+
+    return jsonb_build_object(
+        'form_answer', _updated_form_answer
     );
 end;
 $$;
 
-grant execute on function api.upsert_form_answer(bigint, text, date, jsonb) to authenticated;
+grant execute on function api.upsert_form_answer(bigint, text, date, jsonb, jsonb) to authenticated;
 
 create or replace function api.form_answer_file_upload_url(
     form_question_id bigint,
