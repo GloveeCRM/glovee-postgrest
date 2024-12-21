@@ -5430,6 +5430,50 @@ begin
 end;
 $$;
 
+create or replace function api.repeat_application_form_question_set(form_question_set_id bigint) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _form_question_set forms.form_question_set;
+    _new_form_question_set_position int;
+begin
+    select *
+    into _form_question_set
+    from forms.form_question_set fqs
+    where fqs.form_question_set_id = $1;
+
+    if _form_question_set is null then
+        raise exception 'Form Template Question Set Duplication Failed'
+            using
+                detail = 'The form template question set was not found',
+                hint = 'form_question_set_not_found';
+    end if;
+
+    select coalesce(max(form_question_set_position), 0) + 1
+    into _new_form_question_set_position
+    from forms.form_question_set
+    where parent_form_question_set_id = _form_question_set.parent_form_question_set_id;
+
+    _form_question_set.form_question_set_position := _new_form_question_set_position;
+
+    perform forms.duplicate_form_question_set(
+        _form_question_set,
+        _form_question_set.form_section_id,
+        _form_question_set.parent_form_question_set_id,
+        null
+    );
+
+    return jsonb_build_object(
+        'form_question_sets', to_jsonb(forms.form_section_question_sets(_form_question_set.form_section_id)),
+        'form_questions', forms.form_section_questions(_form_question_set.form_section_id, true)
+    );
+end;
+$$;
+
+grant execute on function api.repeat_application_form_question_set(bigint) to authenticated;
+
 create or replace function forms.duplicate_form_section(_form_section forms.form_section, _new_form_category_id bigint) returns void
     language plpgsql
     security definer

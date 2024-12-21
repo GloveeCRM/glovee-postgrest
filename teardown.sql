@@ -50,6 +50,7 @@ drop function if exists forms.duplicate_form(bigint, bigint);
 drop function if exists forms.form_categories(bigint);
 drop function if exists forms.duplicate_form_category(forms.form_category, bigint);
 drop function if exists forms.form_category_sections(bigint);
+drop function if exists api.repeat_application_form_question_set(bigint);
 drop function if exists forms.duplicate_form_section(forms.form_section, bigint);
 drop function if exists forms.duplicate_form_question_set(forms.form_question_set, bigint, bigint, forms.form_question_option_mapping[]);
 drop function if exists forms.form_section_root_question_sets(bigint);
