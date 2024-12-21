@@ -237,3 +237,10 @@ references:
 - https://www.postgresql.org/docs/current/sql-createview.html
 
 - https://www.postgresql.org/docs/current/sql-createfunction.html
+
+Ideas:
+
+- A how to column
+  -- How to backup postgres db (backup for dummies)
+  -- How to keep track of changes in the db (version control for db)
+  -- Do we need to keep files representings the db functions, tables, etc?
