@@ -5278,14 +5278,24 @@ $$;
 
 grant execute on function api.create_form_template_question_set(bigint, forms.form_question_set_type, int, bigint, bigint) to authenticated;
 
-create or replace function forms.duplicate_form_question_option(_form_question_option forms.form_question_option, _new_form_question_id bigint) returns void
+create type forms.form_question_option_mapping as (
+    source_form_question_option_id bigint,
+    new_form_question_option_id bigint
+);
+
+create or replace function forms.duplicate_form_question_option(_form_question_option forms.form_question_option, _new_form_question_id bigint) returns bigint
     language plpgsql
     security definer
 as
 $$
+declare
+    _new_form_question_option_id bigint;
 begin
     insert into forms.form_question_option (form_question_id, option_text, option_position)
-    values (_new_form_question_id, _form_question_option.option_text, _form_question_option.option_position);
+    values (_new_form_question_id, _form_question_option.option_text, _form_question_option.option_position)
+    returning form_question_option_id into _new_form_question_option_id;
+
+    return _new_form_question_option_id;
 end;
 $$;
 
@@ -5300,7 +5310,10 @@ begin
 end;
 $$;
 
-create or replace function forms.duplicate_form_question(_form_question forms.form_question, _new_form_question_set_id bigint) returns void
+create or replace function forms.duplicate_form_question(
+    _form_question forms.form_question,
+    _new_form_question_set_id bigint
+) returns forms.form_question_option_mapping[]
     language plpgsql
     security definer
 as
@@ -5309,16 +5322,24 @@ declare
     _new_form_question_id bigint;
     _form_question_option forms.form_question_option;
     _form_question_settings forms.form_question_settings := forms.form_question_settings(_form_question.form_question_id);
+    _form_question_option_mapping forms.form_question_option_mapping[];
+    _new_option_id bigint;
 begin
     insert into forms.form_question (form_question_set_id, form_question_prompt, form_question_type, form_question_position)
     values (_new_form_question_set_id, _form_question.form_question_prompt, _form_question.form_question_type, _form_question.form_question_position)
     returning form_question_id into _new_form_question_id;
 
-    for _form_question_option in select unnest(forms.form_question_options(_form_question.form_question_id)) loop
-        perform forms.duplicate_form_question_option(_form_question_option, _new_form_question_id);
+    _form_question_option_mapping := array[]::forms.form_question_option_mapping[];
+    for _form_question_option in select * from forms.form_question_options(_form_question.form_question_id)
+    loop
+        _new_option_id := forms.duplicate_form_question_option(_form_question_option, _new_form_question_id);
+        _form_question_option_mapping := _form_question_option_mapping ||
+            row(_form_question_option.form_question_option_id, _new_option_id)::forms.form_question_option_mapping;
     end loop;
 
     perform forms.duplicate_form_question_setting(_form_question_settings, _new_form_question_id);
+
+    return _form_question_option_mapping;
 end;
 $$;
 
@@ -5353,7 +5374,12 @@ $$
     and fqs.parent_form_question_set_id is null;
 $$;
 
-create or replace function forms.duplicate_form_question_set(_form_question_set forms.form_question_set, _new_form_section_id bigint, _new_parent_form_question_set_id bigint) returns void
+create or replace function forms.duplicate_form_question_set(
+    _form_question_set forms.form_question_set,
+    _new_form_section_id bigint,
+    _new_parent_form_question_set_id bigint,
+    _parent_option_mapping forms.form_question_option_mapping[] default null
+) returns void
     language plpgsql
     security definer
 as
@@ -5362,17 +5388,44 @@ declare
     _new_form_question_set_id bigint;
     _form_question forms.form_question;
     _child_form_question_set forms.form_question_set;
+    _form_question_option_mapping forms.form_question_option_mapping[];
+    _new_depends_on_option_id bigint;
 begin
-    insert into forms.form_question_set (form_section_id, form_question_set_type, form_question_set_position, depends_on_option_id, parent_form_question_set_id)
-    values (_new_form_section_id, _form_question_set.form_question_set_type, _form_question_set.form_question_set_position, _form_question_set.depends_on_option_id, _new_parent_form_question_set_id)
+    if _parent_option_mapping is not null and _form_question_set.depends_on_option_id is not null then
+        select pom.new_form_question_option_id
+        into _new_depends_on_option_id
+        from unnest(_parent_option_mapping) pom
+        where pom.source_form_question_option_id = _form_question_set.depends_on_option_id;
+    end if;
+
+    insert into forms.form_question_set (
+        form_section_id,
+        form_question_set_type,
+        form_question_set_position,
+        depends_on_option_id,
+        parent_form_question_set_id
+    )
+    values (
+        _new_form_section_id,
+        _form_question_set.form_question_set_type,
+        _form_question_set.form_question_set_position,
+        _new_depends_on_option_id,
+        _new_parent_form_question_set_id
+    )
     returning form_question_set_id into _new_form_question_set_id;
 
-    for _form_question in select * from forms.form_question_set_questions(_form_question_set.form_question_set_id) loop
-        perform forms.duplicate_form_question(_form_question, _new_form_question_set_id);
+    for _form_question in select * from forms.form_question_set_questions(_form_question_set.form_question_set_id)
+    loop
+        _form_question_option_mapping := forms.duplicate_form_question(_form_question, _new_form_question_set_id);
     end loop;
 
     for _child_form_question_set in select * from forms.child_form_question_sets(_form_question_set.form_question_set_id) loop
-        perform forms.duplicate_form_question_set(_child_form_question_set, _new_form_section_id, _new_form_question_set_id);
+        perform forms.duplicate_form_question_set(
+            _child_form_question_set,
+            _new_form_section_id,
+            _new_form_question_set_id,
+            _form_question_option_mapping
+        );
     end loop;
 end;
 $$;
