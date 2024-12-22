@@ -3127,11 +3127,22 @@ create or replace function forms.form_organization_id(_form_id bigint) returns b
     stable
 as
 $$
-    select ft.organization_id
-    from forms.form f
-    join forms.form_template ft 
-    on f.form_id = ft.form_id
-    where f.form_id = _form_id;
+    select organization_id
+    from (
+        select ft.organization_id
+        from forms.form f
+        join forms.form_template ft
+        using (form_id)
+        where f.form_id = _form_id
+        
+        union
+        
+        select af.organization_id
+        from forms.form f
+        join applications.application_form af
+        using (form_id)
+        where f.form_id = _form_id
+    ) combined;
 $$;
 
 create or replace function forms.validate_create_form_section_input(
@@ -3928,38 +3939,27 @@ $$
     where form_question_set_id = _form_question_set_id;
 $$;
 
-create or replace function api.delete_form_template_question_set(form_question_set_id bigint) returns jsonb
+create or replace function forms.delete_form_question_set(
+    _form_question_set_id bigint,
+    out validation_failure_message text
+) returns text
     language plpgsql
     security definer
 as
 $$
 declare
-    _current_user_role users.user_role := auth.current_user_role();
-    _target_org_id bigint := auth.current_user_organization_id();
-    _target_form_question_set_position int := forms.form_question_set_position_by_form_question_set_id(form_question_set_id);
-    _parent_form_question_set_id bigint := forms.parent_form_question_set_id_by_form_question_set_id(form_question_set_id);
-    _target_form_section_id bigint := forms.form_section_id_by_form_question_set_id(form_question_set_id);
-    _target_form_id bigint := forms.form_id_by_form_section_id(_target_form_section_id);
-    _target_form_organization_id bigint := forms.form_organization_id(_target_form_id);
+    _parent_form_question_set_id bigint := forms.parent_form_question_set_id_by_form_question_set_id(_form_question_set_id);
+    _target_form_question_set_position int := forms.form_question_set_position(_form_question_set_id);
+    _target_form_section_id bigint := forms.form_section_id_by_form_question_set_id(_form_question_set_id);
 begin
-    if _current_user_role not in ('org_admin', 'org_owner') then
-        raise exception 'Form Template Question Set Deletion Failed'
-            using
-                detail = 'You are not authorized to delete this form template question set',
-                hint = 'unauthorized';
-    end if;
-
     delete from forms.form_question_set fqs
     using forms.form_section fs
-    where fqs.form_question_set_id = $1
-    and fs.form_section_id = fqs.form_section_id
-    and _target_form_organization_id = _target_org_id;
+    where fqs.form_question_set_id = _form_question_set_id
+    and fs.form_section_id = fqs.form_section_id;
 
     if not found then
-        raise exception 'Form Template Question Set Deletion Failed'
-            using
-                detail = 'Form Template Question Set not found',
-                hint = 'form_question_set_not_found';
+        validation_failure_message := 'form_question_set_not_found';
+        return;
     end if;
 
     -- Reorder the question sets
@@ -3978,6 +3978,40 @@ begin
         and form_question_set_position > _target_form_question_set_position;
     end if;
 
+    return;
+end;
+$$;
+
+create or replace function api.delete_form_template_question_set(form_question_set_id bigint) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_user_role users.user_role := auth.current_user_role();
+    _target_org_id bigint := auth.current_user_organization_id();
+    _target_form_section_id bigint := forms.form_section_id_by_form_question_set_id(form_question_set_id);
+    _target_form_id bigint := forms.form_id_by_form_section_id(_target_form_section_id);
+    _target_form_organization_id bigint := forms.form_organization_id(_target_form_id);
+    _validation_failure_message text;
+begin
+    if _current_user_role not in ('org_admin', 'org_owner') 
+        or _target_form_organization_id != _target_org_id
+    then
+        raise exception 'Form Template Question Set Deletion Failed'
+            using
+                detail = 'You are not authorized to delete this form template question set',
+                hint = 'unauthorized';
+    end if;
+
+    _validation_failure_message := forms.delete_form_question_set(form_question_set_id);
+    if _validation_failure_message is not null then
+        raise exception 'Form Template Question Set Deletion Failed'
+            using
+                detail = 'Form Template Question Set not found',
+                hint = 'form_question_set_not_found';
+    end if;
+
     return jsonb_build_object(
         'form_question_sets', to_jsonb(forms.form_section_question_sets(_target_form_section_id))
     );
@@ -3985,6 +4019,34 @@ end;
 $$;
 
 grant execute on function api.delete_form_template_question_set(bigint) to authenticated;
+
+create or replace function api.delete_application_form_question_set(
+    form_question_set_id bigint
+) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _target_form_section_id bigint := forms.form_section_id_by_form_question_set_id(form_question_set_id);
+    _validation_failure_message text;
+begin
+    _validation_failure_message := forms.delete_form_question_set(form_question_set_id);
+    if _validation_failure_message is not null then
+        raise exception 'Application Form Question Set Deletion Failed'
+            using
+                detail = 'Application Form Question Set not found',
+                hint = 'form_question_set_not_found';
+    end if;
+
+    return jsonb_build_object(
+        'form_question_sets', to_jsonb(forms.form_section_question_sets(_target_form_section_id)),
+        'form_questions', forms.form_section_questions(_target_form_section_id, true)
+    );
+end;
+$$;
+
+grant execute on function api.delete_application_form_question_set(bigint) to authenticated;
 
 create or replace function forms.form_id_by_form_question_set_id(_form_question_set_id bigint) returns bigint
     language sql
