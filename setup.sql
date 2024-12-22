@@ -5857,6 +5857,7 @@ create table if not exists forms.form_answer(
     form_question_id bigint not null unique references forms.form_question(form_question_id) on delete cascade,
     answer_text text,
     answer_date date,
+    is_acceptable boolean default false not null,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
 );
@@ -6053,6 +6054,69 @@ begin
 end;
 $$;
 
+create or replace function forms.is_textarea_answer_acceptable(
+    _form_question_id bigint,
+    _answer_text text
+) returns boolean
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _form_question_settings forms.form_question_settings := forms.form_question_settings(_form_question_id);
+    _text_length int := coalesce(length(_answer_text), 0);
+begin
+    if _form_question_settings.minimum_length is not null 
+       and _text_length < _form_question_settings.minimum_length then
+        return false;
+    end if;
+
+    if _form_question_settings.maximum_length is not null 
+       and _text_length > _form_question_settings.maximum_length then
+        return false;
+    end if;
+
+    return true;
+end;
+$$;
+
+create or replace function forms.is_date_answer_acceptable(
+    _form_question_id bigint,
+    _answer_date date
+) returns boolean
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _form_question_settings forms.form_question_settings := forms.form_question_settings(_form_question_id);
+begin
+    if _form_question_settings.minimum_date is not null 
+       and _answer_date < _form_question_settings.minimum_date then
+        return false;
+    end if;
+
+    if _form_question_settings.maximum_date is not null 
+       and _answer_date > _form_question_settings.maximum_date then
+        return false;
+    end if;
+
+    return true;
+end;
+$$;
+
+create or replace function forms.form_question_type(
+    _form_question_id bigint
+) returns text
+    language sql
+    stable
+as
+$$
+    select fq.form_question_type
+    from forms.form_question fq
+    where fq.form_question_id = $1;
+$$;
+
 create or replace function forms.validate_upsert_form_answer_input(
     _form_question_id bigint
 ) returns text
@@ -6088,25 +6152,40 @@ create or replace function forms.upsert_form_answer(
     security definer
 as
 $$
+declare
+    _is_acceptable boolean;
+    _form_question_type text := forms.form_question_type(_form_question_id);
 begin
     validation_failure_message := forms.validate_upsert_form_answer_input(_form_question_id);
     if validation_failure_message is not null then
         return;
     end if;
 
+    case _form_question_type
+        when 'textarea' then
+            _is_acceptable := forms.is_textarea_answer_acceptable(_form_question_id, _answer_text);
+        when 'date' then
+            _is_acceptable := forms.is_date_answer_acceptable(_form_question_id, _answer_date);
+        else
+            _is_acceptable := true;
+    end case;
+
     insert into forms.form_answer (
-        form_question_id, 
-        answer_text, 
-        answer_date
+        form_question_id,
+        answer_text,
+        answer_date,
+        is_acceptable
     ) values (
         _form_question_id, 
         _answer_text, 
-        _answer_date
+        _answer_date,
+        _is_acceptable
     )
     on conflict (form_question_id) do update 
     set 
         answer_text = excluded.answer_text,
         answer_date = excluded.answer_date,
+        is_acceptable = excluded.is_acceptable,
         updated_at = now()
     returning * into upserted_form_answer;
 end;
