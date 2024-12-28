@@ -26,6 +26,10 @@ end$$;
 begin;
 
 -- Drop Forms
+drop function if exists forms.form_section_completion_rate(bigint);
+drop function if exists forms.form_category_completion_rate(bigint);
+drop function if exists forms.form_completion_rate(bigint);
+drop function if exists forms.question_set_is_valid(bigint);
 drop function if exists api.form_answer_file_upload_url(bigint, text, text);
 drop function if exists api.upsert_form_answer(bigint, text, date, jsonb);
 drop function if exists forms.upsert_form_answer(bigint, text, date);

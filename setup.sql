@@ -5718,7 +5718,9 @@ begin
 
     select jsonb_agg(
         to_jsonb(af) || jsonb_build_object(
-            'form', to_jsonb(f)
+            'form', to_jsonb(f) || jsonb_build_object(
+                'completion_rate', forms.form_completion_rate(f.form_id)
+            )
         )
     )
     into _application_forms
@@ -5779,7 +5781,9 @@ begin
 
     -- Select form categories with completion_rate
     select jsonb_agg(
-        to_jsonb(fc) || jsonb_build_object('completion_rate', 0)
+        to_jsonb(fc) || jsonb_build_object(
+            'completion_rate', forms.form_category_completion_rate(fc.form_category_id)
+            )
         order by fc.category_position
     )
     into _application_form_categories
@@ -5788,7 +5792,9 @@ begin
 
     -- Select form sections with completion_rate
     select jsonb_agg(
-        to_jsonb(fs) || jsonb_build_object('completion_rate', 0)
+        to_jsonb(fs) || jsonb_build_object(
+            'completion_rate', forms.form_section_completion_rate(fs.form_section_id)
+        )
         order by fs.section_position
     )
     into _application_form_sections
@@ -5801,7 +5807,9 @@ begin
 
     return jsonb_build_object(
         'application_form', to_jsonb(_application_form) || jsonb_build_object(
-            'form', to_jsonb(_form)
+            'form', to_jsonb(_form) || jsonb_build_object(
+                'completion_rate', forms.form_completion_rate(_form.form_id)
+            )
         ),
         'form_categories', coalesce(_application_form_categories, '[]'::jsonb),
         'form_sections', coalesce(_application_form_sections, '[]'::jsonb)
@@ -6407,5 +6415,159 @@ end;
 $$;
 
 grant execute on function api.form_answer_file_upload_url(bigint, text, text) to authenticated;
+
+create or replace function forms.question_set_is_valid(_form_question_set_id bigint) returns boolean
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _parent_form_question_set_id bigint;
+    _parent_exists boolean;
+    _parent_is_valid boolean;
+    _depended_on_form_question_answered boolean;
+    _depended_on_form_question_option_id bigint;
+begin
+    select
+        parent_form_question_set_id,
+        depends_on_option_id
+    into _parent_form_question_set_id, _depended_on_form_question_option_id
+    from forms.form_question_set
+    where form_question_set_id = _form_question_set_id;
+
+    _parent_exists := _parent_form_question_set_id is not null;
+
+    if _parent_exists then
+        _parent_is_valid := forms.question_set_is_valid(_parent_form_question_set_id);
+    end if;
+
+    if _depended_on_form_question_option_id is not null then
+        select exists(
+            select 1
+            from forms.form_answer_option
+            where form_question_option_id = _depended_on_form_question_option_id
+        ) into _depended_on_form_question_answered;
+    end if;
+
+    -- logic
+    -- valid when 
+    -- ((no parent exists or parent is valid) 
+    -- and (is not depends on or depended on question has been answered))
+
+    return (not _parent_exists or _parent_is_valid)
+        and (_depended_on_form_question_option_id is null or _depended_on_form_question_answered);
+end;
+$$;
+
+create or replace function forms.form_completion_rate(_form_id bigint) returns numeric
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _total_form_question_count bigint;
+    _acceptable_form_question_count bigint;
+begin
+    select 
+        count(distinct fq.form_question_id),
+        count(*) filter ( where fa.is_acceptable )
+    into _total_form_question_count, _acceptable_form_question_count
+    from forms.form_category fc
+    join forms.form_section fs
+    using (form_category_id)
+    join forms.form_question_set fqs
+    using (form_section_id)
+    join forms.form_question fq
+    using (form_question_set_id)
+    join forms.form_question_settings fq_settings
+    using (form_question_id)
+    left join forms.form_answer fa
+    using (form_question_id)
+    where fc.form_id = _form_id
+    and fq_settings.is_required
+    and forms.question_set_is_valid(fqs.form_question_set_id);
+
+    if _total_form_question_count = 0 then
+        return 0.0;
+    end if;
+
+    return round(
+        (_acceptable_form_question_count::numeric / _total_form_question_count::numeric),
+        2
+    );
+end;
+$$;
+
+create or replace function forms.form_category_completion_rate(_form_category_id bigint) returns numeric
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _total_form_question_count bigint;
+    _acceptable_form_question_count bigint;
+begin
+    select 
+        count(distinct fq.form_question_id),
+        count(*) filter ( where fa.is_acceptable )
+    into _total_form_question_count, _acceptable_form_question_count
+    from forms.form_section fs
+    join forms.form_question_set fqs
+    using (form_section_id)
+    join forms.form_question fq
+    using (form_question_set_id)
+    join forms.form_question_settings fq_settings
+    using (form_question_id)
+    left join forms.form_answer fa
+    using (form_question_id)
+    where fs.form_category_id = _form_category_id
+    and fq_settings.is_required = true
+    and forms.question_set_is_valid(fqs.form_question_set_id);
+
+    if _total_form_question_count = 0 then
+        return 0.0;
+    end if;
+
+    return round(
+        (_acceptable_form_question_count::numeric / _total_form_question_count::numeric),
+        2
+    );
+end;
+$$;
+
+create or replace function forms.form_section_completion_rate(_form_section_id bigint) returns numeric
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _total_form_question_count bigint;
+    _acceptable_form_question_count bigint;
+begin
+    select 
+    count(distinct fq.form_question_id),
+    count(*) filter (where fa.is_acceptable)
+    into _total_form_question_count, _acceptable_form_question_count
+    from forms.form_question_set fqs
+    join forms.form_question fq 
+    using (form_question_set_id)
+    join forms.form_question_settings fq_settings
+    using (form_question_id)
+    left join forms.form_answer fa
+    using (form_question_id)
+    where fqs.form_section_id = _form_section_id
+    and fq_settings.is_required = true
+    and forms.question_set_is_valid(fqs.form_question_set_id);
+
+    if _total_form_question_count = 0 then
+        return 0.0;
+    end if;
+
+    return round(
+        (_acceptable_form_question_count::numeric / _total_form_question_count::numeric),
+        2
+    );
+end;
+$$;
 
 commit;
