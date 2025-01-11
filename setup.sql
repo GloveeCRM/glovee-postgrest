@@ -2226,7 +2226,7 @@ begin
 
     _create_application_update_result := applications.create_application_update(
         application_id,
-        'File Uploaded',
+        'new_file_added',
         _current_user_id, 
         null, 
         array[(_create_file_result.created_file).file_id]
@@ -2431,7 +2431,8 @@ begin
                     'email', u.email,
                     'first_name', u.first_name,
                     'last_name', u.last_name,
-                    'full_name', concat(u.first_name, ' ', u.last_name)
+                    'full_name', concat(u.first_name, ' ', u.last_name),
+                    'profile_picture_url', users.profile_picture_url(u.user_id)
                 ),
                 'files', coalesce(uf.files, '[]'::jsonb)
             )
@@ -2545,6 +2546,8 @@ grant usage on schema forms to authenticated;
 
 create table if not exists forms.form (
     form_id bigint default utils.generate_random_id() not null primary key,
+    form_name text not null,
+    form_description text,
     created_by bigint references users.user(user_id) on delete set null,
     created_at timestamp with time zone default now() not null
 );
@@ -2553,14 +2556,13 @@ create table if not exists forms.form_template (
     form_template_id bigint default utils.generate_random_id() not null primary key,
     organization_id bigint references organizations.organization(organization_id) on delete cascade,
     form_id bigint references forms.form(form_id) on delete cascade,
-    template_name text not null,
     created_by bigint references users.user(user_id) on delete set null,
     created_at timestamp with time zone default now() not null
 );
 
 create or replace function forms.validate_create_form_template_input(
     _created_by bigint,
-    _template_name text,
+    _form_name text,
     _organization_id bigint
 ) returns text
     language plpgsql
@@ -2572,8 +2574,8 @@ begin
         return 'missing_created_by';
     end if;
 
-    if _template_name is null or _template_name = '' then
-        return 'missing_template_name';
+    if _form_name is null or _form_name = '' then
+        return 'missing_form_name';
     end if;
 
     if _organization_id is null or _organization_id <= 0 then
@@ -2599,41 +2601,56 @@ $$;
 
 create or replace function forms.create_form_template(
     _created_by bigint,
-    _template_name text,
+    _form_name text,
     _organization_id bigint,
+    _form_description text default null,
     out validation_failure_message text,
     out created_form forms.form,
-    out created_form_template forms.form_template
+    out created_form_template jsonb
 ) returns record
     language plpgsql
     security definer
 as
 $$
+declare
+    _form_id bigint;
+    _form_template_id bigint;
 begin
-    validation_failure_message := forms.validate_create_form_template_input(_created_by, _template_name, _organization_id);
+    validation_failure_message := forms.validate_create_form_template_input(_created_by, _form_name, _organization_id);
     if validation_failure_message is not null then
         return;
     end if;
 
     -- Create the form
-    insert into 
-        forms.form (created_by) 
-    values 
-        (_created_by)
-    returning * into created_form;
+    insert into
+        forms.form (form_name, form_description, created_by)
+    values
+        (_form_name, _form_description, _created_by)
+    returning form_id into _form_id;
 
     -- Create the form template
-    insert into 
-        forms.form_template (form_id, template_name, organization_id, created_by)
+    insert into
+        forms.form_template (form_id, organization_id, created_by)
     values
-        (created_form.form_id, _template_name, _organization_id, _created_by)
-    returning * into created_form_template;
+        (_form_id, _organization_id, _created_by)
+    returning form_template_id into _form_template_id;
+
+    select
+        to_jsonb(ft) || jsonb_build_object('form', to_jsonb(f))
+    into
+        created_form_template
+    from
+        forms.form_template ft
+    join
+        forms.form f
+    using (form_id)
+    where ft.form_template_id = _form_template_id;
 
     return;
 end;
 $$;
 
-create or replace function api.create_form_template(template_name text) returns jsonb
+create or replace function api.create_form_template(form_name text, form_description text default null) returns jsonb
     language plpgsql
     security definer
 as
@@ -2651,7 +2668,7 @@ begin
                 hint = 'unauthorized';
     end if;
 
-    _create_form_result := forms.create_form_template(_current_user_id, template_name, _current_user_org_id);
+    _create_form_result := forms.create_form_template(_current_user_id, form_name, _current_user_org_id, form_description);
     if _create_form_result.validation_failure_message is not null then
         raise exception 'Form Template Creation Failed'
             using
@@ -2665,11 +2682,11 @@ begin
 end;
 $$;
 
-grant execute on function api.create_form_template(text) to authenticated;
+grant execute on function api.create_form_template(text, text) to authenticated;
 
 create or replace function forms.validate_update_form_template_input(
     _form_template_id bigint,
-    _template_name text
+    _form_name text
 ) returns text
     language plpgsql
     security definer
@@ -2680,8 +2697,8 @@ begin
         return 'missing_form_template_id';
     end if;
 
-    if _template_name is null or _template_name = '' then
-        return 'missing_template_name';
+    if _form_name is null or _form_name = '' then
+        return 'missing_form_name';
     end if;
 
     if not exists (
@@ -2701,35 +2718,48 @@ $$;
 
 create or replace function forms.update_form_template(
     _form_template_id bigint,
-    _template_name text,
+    _form_name text,
+    _form_description text default null,
     out validation_failure_message text,
-    out updated_form_template forms.form_template
+    out updated_form_template jsonb
 ) returns record
     language plpgsql
     security definer
 as
 $$
+declare
+    _form_id bigint := forms.form_id_by_form_template_id(_form_template_id);
 begin
-    validation_failure_message := forms.validate_update_form_template_input(_form_template_id, _template_name);
+    validation_failure_message := forms.validate_update_form_template_input(_form_template_id, _form_name);
     if validation_failure_message is not null then
         return;
     end if;
 
     update 
-        forms.form_template
+        forms.form
     set 
-        template_name = _template_name
+        form_name = _form_name,
+        form_description = _form_description
     where 
-        form_template_id = _form_template_id
-    and
-        organization_id = auth.current_user_organization_id()
-    returning * into updated_form_template;
+        form_id = _form_id;
+
+    select
+        to_jsonb(ft) || jsonb_build_object('form', to_jsonb(f))
+    into 
+        updated_form_template
+    from
+        forms.form_template ft
+    join
+        forms.form f
+    using (form_id)
+    where
+        ft.form_template_id = _form_template_id;
 
     return;
 end;
 $$;
 
-create or replace function api.update_form_template(form_template_id bigint, template_name text) returns jsonb
+create or replace function api.update_form_template(form_template_id bigint, form_name text, form_description text default null) returns jsonb
     language plpgsql
     security definer
 as
@@ -2745,7 +2775,7 @@ begin
                 hint = 'unauthorized';
     end if;
 
-    _update_form_template_result := forms.update_form_template(form_template_id, template_name);
+    _update_form_template_result := forms.update_form_template(form_template_id, form_name, form_description);
     if _update_form_template_result.validation_failure_message is not null then
         raise exception 'Form Template Update Failed'
             using
@@ -2759,7 +2789,7 @@ begin
 end;
 $$;
 
-grant execute on function api.update_form_template(bigint, text) to authenticated;
+grant execute on function api.update_form_template(bigint, text, text) to authenticated;
 
 create or replace function api.delete_form_template(form_template_id bigint) returns jsonb
     language plpgsql
@@ -2768,6 +2798,7 @@ as
 $$
 declare
     _current_user_role users.user_role := auth.current_user_role();
+    _target_form_id bigint := forms.form_id_by_form_template_id(form_template_id);
 begin
     if _current_user_role not in ('org_admin', 'org_owner') then
         raise exception 'Form Template Deletion Failed'
@@ -2776,12 +2807,19 @@ begin
                 hint = 'unauthorized';
     end if;
 
-    delete from
-        forms.form_template ft
-    where
-        ft.form_template_id = $1
-    and
-        ft.organization_id = auth.current_user_organization_id();
+    delete from forms.form_template ft
+    where ft.form_template_id = $1
+    and ft.organization_id = auth.current_user_organization_id();
+
+    delete from forms.form f
+    where f.form_id = _target_form_id;
+
+    if not found then
+        raise exception 'Form Template Deletion Failed'
+            using
+                detail = 'Form Template not found',
+                hint = 'form_template_not_found';
+    end if;
 
     return jsonb_build_object('success', true);
 end;
@@ -2794,10 +2832,12 @@ select
     ft.form_template_id,
     ft.organization_id,
     ft.form_id,
-    ft.template_name,
+    to_jsonb(f) as form,
     ft.created_by,
     ft.created_at
 from forms.form_template ft
+join forms.form f
+using (form_id)
 where ft.organization_id = auth.current_user_organization_id();
 
 grant select on api.form_templates to authenticated;
@@ -2898,7 +2938,12 @@ create or replace function forms.form_id_by_form_template_id(_form_template_id b
     stable
 as
 $$
-select form_id from forms.form_template where form_template_id = _form_template_id;
+    select
+        form_id
+    from
+        forms.form_template
+    where form_template_id = _form_template_id
+    and organization_id = auth.current_user_organization_id();
 $$;
 
 create or replace function api.create_form_template_category(form_template_id bigint, category_name text, category_position int) returns jsonb
@@ -4068,7 +4113,8 @@ $$
 declare
     _current_user_role users.user_role := auth.current_user_role();
     _target_org_id bigint := auth.current_user_organization_id();
-    _form_template forms.form_template;
+    _form_template jsonb;
+    _form_id bigint;
     _form_categories forms.form_category[];
     _form_sections forms.form_section[];
 begin
@@ -4079,16 +4125,33 @@ begin
                 hint = 'unauthorized';
     end if;
 
-    select * 
-    into _form_template
-    from forms.form_template ft
-    where ft.form_template_id = $1
-    and ft.organization_id = _target_org_id;
+    select
+        to_jsonb(ft) || jsonb_build_object('form', to_jsonb(f))
+    into
+        _form_template
+    from
+        forms.form_template ft
+    join
+        forms.form f
+    using (form_id)
+    where
+        ft.form_template_id = $1
+    and
+        ft.organization_id = _target_org_id;
+
+    if not found then
+        raise exception 'Form Template With Categories And Sections Retrieval Failed'
+            using
+                detail = 'Form Template not found',
+                hint = 'form_template_not_found';
+    end if;
+
+    _form_id := _form_template->>'form_id';
 
     select array_agg(fc)
     into _form_categories
     from forms.form_category fc
-    where fc.form_id = _form_template.form_id;
+    where fc.form_id = _form_id;
 
     select array_agg(fs)
     into _form_sections
@@ -4096,7 +4159,7 @@ begin
     where fs.form_category_id = any(
         select form_category_id 
         from forms.form_category 
-        where form_id = _form_template.form_id
+        where form_id = _form_id
     );
 
     return jsonb_build_object(
@@ -5598,7 +5661,7 @@ $$
     where fc.form_id = _form_id;
 $$;
 
-create or replace function forms.duplicate_form(_form_id bigint, _created_by bigint) returns bigint
+create or replace function forms.duplicate_form(_form_id bigint, _created_by bigint, _form_name text) returns bigint
     language plpgsql
     security definer
 as
@@ -5607,8 +5670,8 @@ declare
     _new_form_id bigint;
     _form_category forms.form_category;
 begin
-    insert into forms.form (created_by)
-    values (_created_by)
+    insert into forms.form (form_name, created_by)
+    values (_form_name, _created_by)
     returning form_id into _new_form_id;
 
     for _form_category in select * from forms.form_categories(_form_id) loop
@@ -5619,11 +5682,15 @@ begin
 end;
 $$;
 
+create domain applications.application_form_status as text
+    check (value in ('pending_client_submission', 'client_submitted', 'pending_organization_review', 'organization_approved', 'pending_client_revision'));
+
 create table if not exists applications.application_form(
     application_form_id bigint default utils.generate_random_id() not null primary key,
     organization_id bigint not null references organizations.organization(organization_id) on delete cascade,
     application_id bigint not null references applications.application(application_id) on delete cascade,
     form_id bigint not null references forms.form(form_id) on delete cascade,
+    status applications.application_form_status not null default 'pending_client_submission',
     created_by bigint references users.user(user_id) on delete set null,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
@@ -5645,7 +5712,7 @@ begin
 end;
 $$;
 
-create or replace function api.create_application_form(application_id bigint, form_template_id bigint) returns jsonb
+create or replace function api.create_application_form(application_id bigint, form_template_id bigint, form_name text) returns jsonb
     language plpgsql
     security definer
 as
@@ -5671,9 +5738,17 @@ begin
                 hint = 'form_template_not_found';
     end if;
 
+    if form_name is null or form_name = '' then
+        raise exception 'Form Creation Failed'
+            using
+                detail = 'The form name is required',
+                hint = 'form_name_required';
+    end if;
+
     _new_form_id := forms.duplicate_form(
         _existing_form_id,
-        auth.current_user_id()
+        auth.current_user_id(),
+        form_name
     );
 
     _application_form_id := applications.create_application_form(
@@ -5697,7 +5772,7 @@ begin
 end;
 $$;
 
-grant execute on function api.create_application_form(bigint, bigint) to authenticated;
+grant execute on function api.create_application_form(bigint, bigint, text) to authenticated;
 
 create or replace function api.application_forms(application_id bigint) returns jsonb
     language plpgsql
@@ -5719,13 +5794,22 @@ begin
     select jsonb_agg(
         to_jsonb(af) || jsonb_build_object(
             'form', to_jsonb(f) || jsonb_build_object(
-                'completion_rate', forms.form_completion_rate(f.form_id)
+                'completion_rate', forms.form_completion_rate(f.form_id),
+                'categories', (
+                    select jsonb_agg(to_jsonb(fc) || jsonb_build_object(
+                        'completion_rate', forms.form_category_completion_rate(fc.form_category_id)
+                        )
+                    )
+                    from forms.form_category fc
+                    where fc.form_id = f.form_id
+                )
             )
         )
     )
     into _application_forms
     from applications.application_form af
-    join forms.form f on f.form_id = af.form_id
+    join forms.form f
+    using (form_id)
     where af.application_id = $1
     and af.organization_id = auth.current_user_organization_id();
 
@@ -6569,5 +6653,101 @@ begin
     );
 end;
 $$;
+
+create or replace function api.auth_user_profile() returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_user_id bigint := auth.current_user_id();
+    _current_user_org_id bigint := auth.current_user_organization_id();
+    _org_config organizations.organization_config;
+    _auth_user_profile jsonb;
+begin
+    _org_config := organizations.config_by_org_id(_current_user_org_id);
+
+    select (
+        select to_jsonb(u.*) - 'hashed_password' ||
+        jsonb_build_object(
+            'role', users.user_role(_current_user_id),
+            'status', users.user_status(_current_user_id),
+            'profile_picture_url', (
+                select 
+                    aws.generate_s3_presigned_url(
+                        _org_config.s3_bucket,
+                        f.object_key,
+                        _org_config.s3_region,
+                        'GET',
+                        3600
+                    )
+                from files.file f
+                where f.file_id = u.profile_picture_file_id
+            )
+        )
+        from users.user u
+        where u.user_id = _current_user_id
+        limit 1
+    ) into _auth_user_profile;
+
+    return jsonb_build_object(
+        'user', _auth_user_profile
+    );
+end;
+$$;
+
+grant execute on function api.auth_user_profile() to authenticated;
+
+create or replace function api.application_owner_profile(application_id bigint) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_user_role users.user_role := auth.current_user_role();
+    _current_user_org_id bigint := auth.current_user_organization_id();
+    _application_owner_id bigint := applications.application_user_id(application_id);
+    _org_config organizations.organization_config;
+    _application_owner_profile jsonb;
+begin
+    if _current_user_role not in ('org_admin', 'org_owner') then
+        raise exception 'Application Client Profile Retrieval Failed'
+            using
+                detail = 'You are not authorized to retrieve the application client profile',
+                hint = 'unauthorized';
+    end if;
+
+    _org_config := organizations.config_by_org_id(_current_user_org_id);
+
+    select (
+        select to_jsonb(u.*) - 'hashed_password' ||
+        jsonb_build_object(
+            'role', users.user_role(_application_owner_id),
+            'status', users.user_status(_application_owner_id),
+            'profile_picture_url', (
+                select aws.generate_s3_presigned_url(
+                    _org_config.s3_bucket,
+                    f.object_key,
+                    _org_config.s3_region,
+                    'GET',
+                    3600
+                )
+                from files.file f
+                where f.file_id = u.profile_picture_file_id
+            )
+        )
+        from users.user u
+        where u.user_id = _application_owner_id
+        and u.organization_id = _current_user_org_id
+        limit 1
+    ) into _application_owner_profile;
+
+    return jsonb_build_object(
+        'user', _application_owner_profile
+    );
+end;
+$$;
+
+grant execute on function api.application_owner_profile(bigint) to authenticated;
 
 commit;

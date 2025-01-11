@@ -26,6 +26,8 @@ end$$;
 begin;
 
 -- Drop Forms
+drop function if exists api.application_owner_profile(bigint);
+drop function if exists api.auth_user_profile();
 drop function if exists forms.form_section_completion_rate(bigint);
 drop function if exists forms.form_category_completion_rate(bigint);
 drop function if exists forms.form_completion_rate(bigint);
@@ -50,10 +52,10 @@ drop function if exists forms.form_section_application_form_id(bigint);
 drop function if exists api.application_form_categories_and_sections(bigint);
 drop function if exists applications.application_form_owner_id(bigint);
 drop function if exists api.application_forms(bigint);
-drop function if exists api.create_application_form(bigint, bigint);
+drop function if exists api.create_application_form(bigint, bigint, text);
 drop function if exists applications.create_application_form(bigint, bigint, bigint, bigint);
 drop table if exists applications.application_form;
-drop function if exists forms.duplicate_form(bigint, bigint);
+drop function if exists forms.duplicate_form(bigint, bigint, text);
 drop function if exists forms.form_categories(bigint);
 drop function if exists forms.duplicate_form_category(forms.form_category, bigint);
 drop function if exists forms.form_category_sections(bigint);
@@ -142,11 +144,11 @@ drop function if exists forms.validate_create_form_category_input(bigint, text, 
 drop function if exists forms.form_id_by_form_template_id(bigint);
 drop view if exists api.form_templates;
 drop function if exists api.delete_form_template(bigint);
-drop function if exists api.update_form_template(bigint, text);
-drop function if exists forms.update_form_template(bigint, text);
+drop function if exists api.update_form_template(bigint, text, text);
+drop function if exists forms.update_form_template(bigint, text, text);
 drop function if exists forms.validate_update_form_template_input(bigint, text);
-drop function if exists api.create_form_template(text);
-drop function if exists forms.create_form_template(bigint, text, bigint);
+drop function if exists api.create_form_template(text, text);
+drop function if exists forms.create_form_template(bigint, text, bigint, text);
 drop function if exists forms.validate_create_form_template_input(bigint, text, bigint);
 
 -- Drop Application Files
