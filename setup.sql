@@ -1797,6 +1797,7 @@ create schema if not exists applications;
 create table applications.application (
     application_id bigint default utils.generate_random_id() not null primary key,
     user_id bigint not null references users.user(user_id) on delete set null,
+    application_name text not null,
     created_at timestamp with time zone not null default now(),
     updated_at timestamp with time zone not null default now()
 );
@@ -1838,7 +1839,8 @@ $$
 $$;
 
 create or replace function applications.validate_create_application_input(
-    _user_id bigint
+    _user_id bigint,
+    _application_name text
 ) returns text
     language plpgsql
 as
@@ -1848,12 +1850,17 @@ begin
         return 'missing_user_id';
     end if;
 
+    if _application_name is null or _application_name = '' then
+        return 'missing_application_name';
+    end if;
+
     return null;
 end;
 $$;
 
 create or replace function applications.create_application(
     _user_id bigint,
+    _application_name text,
     out validation_failure_message text,
     out created_application applications.application
 )
@@ -1862,13 +1869,13 @@ create or replace function applications.create_application(
 as
 $$
 begin
-    validation_failure_message := applications.validate_create_application_input(_user_id);
+    validation_failure_message := applications.validate_create_application_input(_user_id, _application_name);
     if validation_failure_message is not null then
         return;
     end if;
 
-    insert into applications.application (user_id)
-    values (_user_id)
+    insert into applications.application (user_id, application_name)
+    values (_user_id, _application_name)
     returning * into created_application;
 
     return;
@@ -2068,7 +2075,7 @@ end;
 $$;
 
 
-create or replace function api.create_application(user_id bigint) returns jsonb
+create or replace function api.create_application(user_id bigint, application_name text) returns jsonb
     language plpgsql
     security definer
 as
@@ -2087,7 +2094,7 @@ begin
                 hint = 'user_not_found';
     end if;
 
-    _create_application_result := applications.create_application(user_id);
+    _create_application_result := applications.create_application(user_id, application_name);
     if _create_application_result.validation_failure_message is not null then
         raise exception 'Application Creation Failed'
             using
@@ -2101,7 +2108,7 @@ begin
 end;
 $$;
 
-grant execute on function api.create_application(bigint) to authenticated;
+grant execute on function api.create_application(bigint, text) to authenticated;
 
 -- Application Files
 create or replace function applications.application_organization_id(_application_id bigint) returns bigint
@@ -2465,6 +2472,7 @@ grant execute on function api.application_updates(bigint) to authenticated;
 create or replace view api.applications as
 select
     a.application_id,
+    a.application_name,
     a.user_id,
     jsonb_build_object(
         'user_id', u.user_id,
@@ -5819,6 +5827,53 @@ $$;
 
 grant execute on function api.application_forms(bigint) to authenticated;
 
+create or replace function api.application_form(application_form_id bigint) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_user_role users.user_role := auth.current_user_role();
+    _application_form_owner_id bigint := applications.application_form_owner_id(application_form_id);
+    _application_form jsonb;
+begin
+    if (_current_user_role = 'org_client' and _application_form_owner_id != auth.current_user_id())
+    or _current_user_role not in ('org_admin', 'org_owner', 'org_client') then
+        raise exception 'Application Form Retrieval Failed'
+            using
+                detail = 'You are not authorized to retrieve the application form',
+                hint = 'unauthorized';
+    end if;
+
+    select jsonb_build_object(
+        'application_form',
+        to_jsonb(af) || jsonb_build_object(
+            'form', to_jsonb(f) || jsonb_build_object(
+                'completion_rate', forms.form_completion_rate(f.form_id),
+                'categories', (
+                    select jsonb_agg(to_jsonb(fc) || jsonb_build_object(
+                        'completion_rate', forms.form_category_completion_rate(fc.form_category_id)
+                        )
+                    )
+                    from forms.form_category fc
+                    where fc.form_id = f.form_id
+                )
+            )
+        )
+    )
+    into _application_form
+    from applications.application_form af
+    join forms.form f
+    using (form_id)
+    where af.application_form_id = $1
+    and af.organization_id = auth.current_user_organization_id();
+
+    return _application_form;
+end;
+$$;
+
+grant execute on function api.application_form(bigint) to authenticated;
+
 create or replace function applications.application_form_owner_id(_application_form_id bigint) returns bigint
     language sql
     stable
@@ -6697,57 +6752,5 @@ end;
 $$;
 
 grant execute on function api.auth_user_profile() to authenticated;
-
-create or replace function api.application_owner_profile(application_id bigint) returns jsonb
-    language plpgsql
-    security definer
-as
-$$
-declare
-    _current_user_role users.user_role := auth.current_user_role();
-    _current_user_org_id bigint := auth.current_user_organization_id();
-    _application_owner_id bigint := applications.application_user_id(application_id);
-    _org_config organizations.organization_config;
-    _application_owner_profile jsonb;
-begin
-    if _current_user_role not in ('org_admin', 'org_owner') then
-        raise exception 'Application Client Profile Retrieval Failed'
-            using
-                detail = 'You are not authorized to retrieve the application client profile',
-                hint = 'unauthorized';
-    end if;
-
-    _org_config := organizations.config_by_org_id(_current_user_org_id);
-
-    select (
-        select to_jsonb(u.*) - 'hashed_password' ||
-        jsonb_build_object(
-            'role', users.user_role(_application_owner_id),
-            'status', users.user_status(_application_owner_id),
-            'profile_picture_url', (
-                select aws.generate_s3_presigned_url(
-                    _org_config.s3_bucket,
-                    f.object_key,
-                    _org_config.s3_region,
-                    'GET',
-                    3600
-                )
-                from files.file f
-                where f.file_id = u.profile_picture_file_id
-            )
-        )
-        from users.user u
-        where u.user_id = _application_owner_id
-        and u.organization_id = _current_user_org_id
-        limit 1
-    ) into _application_owner_profile;
-
-    return jsonb_build_object(
-        'user', _application_owner_profile
-    );
-end;
-$$;
-
-grant execute on function api.application_owner_profile(bigint) to authenticated;
 
 commit;

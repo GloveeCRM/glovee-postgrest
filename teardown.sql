@@ -26,7 +26,6 @@ end$$;
 begin;
 
 -- Drop Forms
-drop function if exists api.application_owner_profile(bigint);
 drop function if exists api.auth_user_profile();
 drop function if exists forms.form_section_completion_rate(bigint);
 drop function if exists forms.form_category_completion_rate(bigint);
@@ -52,6 +51,7 @@ drop function if exists forms.form_section_application_form_id(bigint);
 drop function if exists api.application_form_categories_and_sections(bigint);
 drop function if exists applications.application_form_owner_id(bigint);
 drop function if exists api.application_forms(bigint);
+drop function if exists api.application_form(bigint);
 drop function if exists api.create_application_form(bigint, bigint, text);
 drop function if exists applications.create_application_form(bigint, bigint, bigint, bigint);
 drop table if exists applications.application_form;
@@ -167,9 +167,9 @@ drop table if exists applications.application_file;
 
 -- Drop Applications
 drop view if exists api.applications;
-drop function if exists api.create_application(bigint);
-drop function if exists applications.create_application(bigint);
-drop function if exists applications.validate_create_application_input(bigint);
+drop function if exists api.create_application(bigint, text);
+drop function if exists applications.create_application(bigint, text);
+drop function if exists applications.validate_create_application_input(bigint, text);
 drop function if exists applications.application_user_id(bigint);
 drop function if exists applications.application_organization_id(bigint);
 drop table if exists applications.application;
