@@ -26,6 +26,9 @@ end$$;
 begin;
 
 -- Drop Forms
+drop function if exists api.update_application_form_status(bigint, text);
+drop function if exists applications.application_form_form_id(bigint);
+drop function if exists applications.application_form_application_id(bigint);
 drop function if exists api.auth_user_profile();
 drop function if exists forms.form_section_completion_rate(bigint);
 drop function if exists forms.form_category_completion_rate(bigint);

@@ -6753,4 +6753,133 @@ $$;
 
 grant execute on function api.auth_user_profile() to authenticated;
 
+create or replace function applications.application_form_application_id(_application_form_id bigint) returns bigint
+    language sql
+    stable
+as
+$$
+    select 
+        af.application_id
+    from
+        applications.application_form af
+    where
+        af.application_form_id = _application_form_id;
+$$;
+
+create or replace function applications.application_form_form_id(_application_form_id bigint) returns bigint
+    language sql
+    stable
+as
+$$
+    select
+        af.form_id
+    from
+        applications.application_form af
+    where
+        af.application_form_id = _application_form_id;
+$$;
+
+create or replace function api.update_application_form_status(
+    application_form_id bigint,
+    status text
+) returns jsonb
+    language plpgsql
+    security definer
+as
+$$
+declare
+    _current_user_id bigint := auth.current_user_id();
+    _current_user_role users.user_role := auth.current_user_role();
+    _current_org_id bigint := auth.current_user_organization_id();
+    _application_form_owner_id bigint := applications.application_form_owner_id(application_form_id);
+    _application_id bigint := applications.application_form_application_id(application_form_id);
+    _application_organization_id bigint := applications.application_organization_id(_application_id);
+    _form_id bigint := applications.application_form_form_id(application_form_id);
+    _form_completion_rate numeric := forms.form_completion_rate(_form_id);
+    _create_application_update_result record;
+begin
+    if _current_user_role = 'org_client' and _application_form_owner_id != _current_user_id then
+        raise exception 'Application Form Status Update Failed'
+            using
+                detail = 'You are not authorized to update the application form status',
+                hint = 'unauthorized';
+    elsif _current_user_role in ('org_admin', 'org_owner') and _current_org_id != _application_organization_id then
+        raise exception 'Application Form Status Update Failed'
+            using
+                detail = 'You are not authorized to update the application form status',
+                hint = 'unauthorized';
+    end if;
+
+    if _current_user_role = 'org_client' and status != 'client_submitted' then
+        raise exception 'Application Form Status Update Failed'
+            using
+                detail = 'Client can only submit the application form',
+                hint = 'application_form_status_update_failed';
+    elsif _current_user_role in ('org_admin', 'org_owner') and status = 'client_submitted' then
+        raise exception 'Application Form Status Update Failed'
+            using
+                detail = 'Organization cannot submit the application form',
+                hint = 'application_form_status_update_failed';
+    end if;
+
+    if status not in (
+        'pending_client_submission',
+        'client_submitted',
+        'pending_organization_review',
+        'organization_approved',
+        'pending_client_revision'
+    ) then
+        raise exception 'Application Form Status Update Failed'
+            using
+                detail = 'Invalid status',
+                hint = 'invalid_application_form_status';
+    end if;
+
+    if not exists (
+        select 1
+        from applications.application_form af
+        where af.application_form_id = $1
+        and af.organization_id = _application_organization_id
+    ) then
+        raise exception 'Application Form Status Update Failed'
+            using
+                detail = 'Application form not found',
+                hint = 'application_form_not_found';
+    end if;
+
+    if _form_completion_rate < 1.00 then
+        raise exception 'Application Form Status Update Failed'
+            using
+                detail = 'Application form is not complete',
+                hint = 'application_form_not_complete';
+    end if;
+
+    update 
+        applications.application_form af
+    set 
+        status = $2
+    where af.application_form_id = $1;
+
+    _create_application_update_result := applications.create_application_update(
+        _application_id,
+        'application_form_status_updated',
+        _current_user_id, 
+        status,
+        null
+    );
+    if _create_application_update_result.validation_failure_message is not null then
+        raise exception 'Application Form Status Update Failed'
+            using
+                detail = 'Invalid Request Payload',
+                hint = _create_application_update_result.validation_failure_message;
+    end if;
+
+    return jsonb_build_object(
+        'status', status
+    );
+end;
+$$;
+
+grant execute on function api.update_application_form_status(bigint, text) to authenticated;
+
 commit;
