@@ -136,6 +136,8 @@ create table organizations.organization_config
     organization_id bigint references organizations.organization(organization_id) on delete cascade,
     s3_bucket text not null,
     s3_region text not null,
+    aws_iam_lambda_account_number text not null,
+    aws_iam_lambda_region text not null,
     created_at timestamp with time zone default now(),
     updated_at timestamp with time zone default now(),
     created_by bigint references users.user(user_id) on delete set null,
@@ -1087,13 +1089,13 @@ language plpgsql
 security definer
 as $$
 declare
-    _aws_iam_s3_presigned_url_lambda_account_number text := config.get('aws_iam_s3_presigned_url_lambda_account_number');
+    _aws_iam_lambda_account_number text := config.get('aws_iam_lambda_account_number');
     _function_name text;
     _lambda_payload json;
     _lambda_response record;
     _url text;
 begin
-    _function_name := 'arn:aws:lambda:' || _region || ':' || _aws_iam_s3_presigned_url_lambda_account_number || ':function:s3PresignedURL';
+    _function_name := 'arn:aws:lambda:' || _region || ':' || _aws_iam_lambda_account_number || ':function:s3PresignedURL';
 
     _lambda_payload := json_build_object(
         'bucket', _bucket_name,
@@ -1122,6 +1124,51 @@ end;
 $$;
 
 grant execute on function aws.generate_s3_presigned_url(text, text, text, text, int) to anon, authenticated;
+
+create or replace function aws.generate_comms(
+    _method text,
+    _message jsonb,
+    _region text,
+    out failure_message text,
+    out payload text
+)
+returns record
+language plpgsql
+security definer
+as $$
+declare
+    _aws_iam_lambda_account_number text := config.get('aws_iam_lambda_account_number');
+    _function_name text;
+    _lambda_payload json;
+    _lambda_response record;
+    _parsed_lambda_response jsonb;
+begin
+    _function_name := 'arn:aws:lambda:' || _region || ':' || _aws_iam_lambda_account_number || ':function:comms';
+
+    _lambda_payload := json_build_object(
+        'method', _method,
+        'message', _message
+    );
+
+    _lambda_response := aws_lambda.invoke(
+        function_name := _function_name,
+        payload := _lambda_payload,
+        region := _region
+    );
+
+    _parsed_lambda_response := _lambda_response.payload::jsonb;
+
+    -- check if the call was successful
+    if (_parsed_lambda_response->>'status_code')::int != 200 then
+        failure_message := 'lambda invocation failed with status code ' || (_parsed_lambda_response->>'status_code')::int || ' and error ' || ((_parsed_lambda_response->>'body')::json->>'error');
+        return;
+    end if;
+
+    payload := _lambda_response.payload;
+
+    return;
+end;
+$$;
 
 -- Files
 create or replace function files.generate_url(_file_id bigint) returns text
@@ -6882,4 +6929,6 @@ $$;
 
 grant execute on function api.update_application_form_status(bigint, text) to authenticated;
 
-commit;
+
+
+drop function if exists comms.send_email(text, text, text, text);
