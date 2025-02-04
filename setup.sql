@@ -1555,6 +1555,7 @@ declare
     _org_access_validation_failure_message text;
     _password text;
     _create_user_result record;
+    _send_email_response record;
 begin
     _org_access_validation_failure_message := auth.validate_current_user_org_access(org_name);
     if _org_access_validation_failure_message is not null then
@@ -1579,6 +1580,20 @@ begin
             using
                 detail = 'Invalid Request Payload',
                 hint = _create_user_result.validation_failure_message;
+    end if;
+
+    _send_email_response := comms.send_email(
+        'welcome@glovee.io',
+        _create_user_result.created_user->>'email',
+        'You are invited to join Glovee!',
+        'You are invited to join Glovee. Please use the following link to login: ' || 'https://' || org_name || '.glovee.io'
+    );
+
+    if _send_email_response.failure_message is not null then
+        raise exception 'Client Creation Failed'
+            using
+                detail = 'Failed to send email',
+                hint = _send_email_response.failure_message;
     end if;
 
     return jsonb_build_object(

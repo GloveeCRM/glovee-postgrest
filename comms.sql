@@ -16,6 +16,7 @@ create or replace function comms.send_email(
     _to_email text,
     _subject text,
     _html text,
+    _organization_id bigint default null,
     out failure_message text,
     out generated_email comms.email
 )
@@ -26,11 +27,16 @@ as $$
 declare
     _email_payload jsonb;
     _email_response record;
-    _current_org_id bigint := auth.current_user_organization_id();
-    _organization_config organizations.organization_config := organizations.config_by_org_id(_current_org_id);
+    _current_org_id bigint;
+    _organization_config organizations.organization_config;
 begin
-    failure_message := null;
-    generated_email := null;
+    if _organization_id is null then
+        _current_org_id := auth.current_user_organization_id();
+    else
+        _current_org_id := _organization_id;
+    end if;
+
+    _organization_config := organizations.config_by_org_id(_current_org_id);
 
     _email_payload := json_build_object(
         'from', _from_email,
