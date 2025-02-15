@@ -38,10 +38,17 @@ The database initialization and migrations are organized as follows:
    npm install
    ```
 
-2. Generate a migration ID using the provided script:
+2. Generate a migration file and ID using the provided script:
 
    ```bash
-   npm run migration:id your_migration_name
+   npm run migration:create <your_migration_name>
+   ```
+
+   This will create a new file in the `migrations/` directory with the generated ID and the provided name:
+
+   ```
+   migrations/
+   └── {generated_id}.sql
    ```
 
    The name must:
@@ -51,14 +58,7 @@ The database initialization and migrations are organized as follows:
    - Only use lowercase letters, numbers, and underscores
      Example: `create_users_table`
 
-3. Create a new SQL file in the `migrations/` directory using the generated ID:
-
-   ```
-   migrations/
-   └── {generated_id}.sql
-   ```
-
-4. Write your migration SQL in the new file.
+3. Write your migration SQL in the new file.
 
 ### Applying Migrations
 
