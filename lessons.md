@@ -232,6 +232,19 @@ By default, all users can execute all functions for schemas they have `usage` gr
 }
 ```
 
+## Multiple schemas
+
+- Passing the schema name like `PGRST_DB_SCHEMAS="api,services_api"` is not enough.
+- Postgrest searches for the first schema by default.
+- To fix, you need to specify schema name in headers `Accept-Profile` and `Content-Profile`
+
+example:
+
+```
+Accept-Profile: services_api
+Content-Profile: services_api
+```
+
 references:
 
 - https://www.postgresql.org/docs/current/sql-createview.html

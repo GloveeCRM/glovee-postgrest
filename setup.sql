@@ -1846,6 +1846,10 @@ select
                 3600
             )
     end as profile_picture_url,
+    jsonb_build_object(
+        'file_id', u.profile_picture_file_id,
+        'file_name', f.file_name
+    ) as profile_picture_file,
     u.created_at,
     u.updated_at
 from users.user u
