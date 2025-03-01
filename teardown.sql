@@ -184,7 +184,6 @@ drop view if exists api.clients;
 
 -- Drop AWS functions
 drop function if exists aws.generate_s3_presigned_url(text, text, text, text, int);
-drop function if exists aws.generate_comms(text, jsonb, text);
 
 -- Drop file functions
 drop function if exists files.create_file(text, text, text, text, text, bigint, bigint, bigint, boolean, jsonb);

@@ -1106,51 +1106,6 @@ $$;
 
 grant execute on function aws.generate_s3_presigned_url(text, text, text, text, int) to anon, authenticated;
 
-create or replace function aws.generate_comms(
-    _method text,
-    _message jsonb,
-    _region text,
-    out failure_message text,
-    out payload text
-)
-returns record
-language plpgsql
-security definer
-as $$
-declare
-    _aws_iam_lambda_account_number text := config.get('aws_iam_lambda_account_number');
-    _function_name text;
-    _lambda_payload json;
-    _lambda_response record;
-    _parsed_lambda_response jsonb;
-begin
-    _function_name := 'arn:aws:lambda:' || _region || ':' || _aws_iam_lambda_account_number || ':function:comms';
-
-    _lambda_payload := json_build_object(
-        'method', _method,
-        'message', _message
-    );
-
-    _lambda_response := aws_lambda.invoke(
-        function_name := _function_name,
-        payload := _lambda_payload,
-        region := _region
-    );
-
-    _parsed_lambda_response := _lambda_response.payload::jsonb;
-
-    -- check if the call was successful
-    if (_parsed_lambda_response->>'status_code')::int != 200 then
-        failure_message := 'lambda invocation failed with status code ' || (_parsed_lambda_response->>'status_code')::int || ' and error ' || ((_parsed_lambda_response->>'body')::json->>'error');
-        return;
-    end if;
-
-    payload := _lambda_response.payload;
-
-    return;
-end;
-$$;
-
 -- Files
 create or replace function files.get_file_extension_from_mimetype(_mime_type text)
 returns text
