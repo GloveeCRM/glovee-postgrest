@@ -1836,19 +1836,9 @@ select
     concat(u.first_name, ' ', u.last_name) as full_name,
     users.user_role(u.user_id) as role,
     users.user_status(u.user_id) as status,
-    case
-        when f.file_id is not null then
-            aws.generate_s3_presigned_url(
-                f.bucket,
-                f.object_key,
-                f.region,
-                'GET',
-                3600
-            )
-    end as profile_picture_url,
     jsonb_build_object(
         'file_id', u.profile_picture_file_id,
-        'file_name', f.file_name
+        'file_name', f.name
     ) as profile_picture_file,
     u.created_at,
     u.updated_at
@@ -6805,20 +6795,14 @@ begin
         jsonb_build_object(
             'role', users.user_role(_current_user_id),
             'status', users.user_status(_current_user_id),
-            'profile_picture_url', (
-                select 
-                    aws.generate_s3_presigned_url(
-                        _org_config.s3_bucket,
-                        f.object_key,
-                        _org_config.s3_region,
-                        'GET',
-                        3600
-                    )
-                from files.file f
-                where f.file_id = u.profile_picture_file_id
+            'profile_picture_file', jsonb_build_object(
+                'file_id', u.profile_picture_file_id,
+                'file_name', f.name
             )
         )
         from users.user u
+        left join files.file f
+        on f.file_id = u.profile_picture_file_id
         where u.user_id = _current_user_id
         limit 1
     ) into _auth_user_profile;
