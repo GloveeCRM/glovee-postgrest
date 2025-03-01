@@ -1806,22 +1806,15 @@ select
     o.organization_id,
     o.name,
     o.org_name,
-    case 
-        when f.file_id is not null then 
-            aws.generate_s3_presigned_url(
-                f.bucket,
-                f.object_key,
-                f.region,
-                'GET',
-                3600
-            )
-        else 
-            null
-    end as logo_url,
+    jsonb_build_object(
+        'file_id', f.file_id,
+        'file_name', f.name
+    ) as logo_file,
     o.created_at,
     o.updated_at
 from organizations.organization o
-left join files.file f on o.logo_file_id = f.file_id;
+left join files.file f
+on o.logo_file_id = f.file_id;
 
 grant select on api.organizations to anon;
 
@@ -2450,7 +2443,6 @@ declare
     _current_user_id bigint := auth.current_user_id();
     _current_user_org_id bigint := auth.current_user_organization_id();
     _current_user_role users.user_role := auth.current_user_role();
-    _organization_config organizations.organization_config := organizations.config_by_org_id(_current_user_org_id);
     _application_updates jsonb;
 begin
     if (_current_user_role = 'org_client' and applications.application_user_id($1) != _current_user_id)
@@ -2462,23 +2454,15 @@ begin
     end if;
 
     with update_files as (
-        select 
+        select
             au.application_update_id,
             jsonb_agg(
                 jsonb_build_object(
                     'file_id', f.file_id,
-                    'name', f.name,
-                    'mime_type', f.mime_type,
-                    'url', aws.generate_s3_presigned_url(
-                        _organization_config.s3_bucket,
-                        f.object_key,
-                        _organization_config.s3_region,
-                        'GET',
-                        3600
-                    )
+                    'name', f.name
                 )
             ) as files
-        from 
+        from
             applications.application_update au
         join
             applications.application_update_file aup
@@ -2507,20 +2491,27 @@ begin
                     'first_name', u.first_name,
                     'last_name', u.last_name,
                     'full_name', concat(u.first_name, ' ', u.last_name),
-                    'profile_picture_url', users.profile_picture_url(u.user_id)
+                    'profile_picture_file', jsonb_build_object(
+                        'file_id', f.file_id,
+                        'name', f.name
+                    )
                 ),
                 'files', coalesce(uf.files, '[]'::jsonb)
             )
             order by au.created_at desc
         )
-    into 
+    into
         _application_updates
-    from 
+    from
         applications.application_update au
     join
         users.user u
     on
         au.created_by = u.user_id
+    left join
+        files.file f
+    on
+        u.profile_picture_file_id = f.file_id
     left join
         update_files uf
     on
