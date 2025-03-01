@@ -2372,7 +2372,6 @@ declare
     _current_user_id bigint := auth.current_user_id();
     _current_user_org_id bigint := auth.current_user_organization_id();
     _current_user_role users.user_role := auth.current_user_role();
-    _organization_config organizations.organization_config := organizations.config_by_org_id(_current_user_org_id);
     _application_files jsonb;
 begin
     if (_current_user_role = 'org_client' and applications.application_user_id($1) != _current_user_id)
@@ -2390,13 +2389,6 @@ begin
                 'name', f.name,
                 'mime_type', f.mime_type,
                 'size', f.size,
-                'url', aws.generate_s3_presigned_url(
-                    _organization_config.s3_bucket,
-                    f.object_key,
-                    _organization_config.s3_region,
-                    'GET',
-                    3600
-                ),
                 'metadata', f.metadata,
                 'created_at', af.created_at,
                 'updated_at', af.updated_at
