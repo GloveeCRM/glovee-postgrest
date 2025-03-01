@@ -717,25 +717,6 @@ $$;
 
 grant execute on function users.user_status(bigint) to anon, authenticated;
 
-create or replace function users.profile_picture_url(_user_id bigint) returns text
-    language plpgsql
-    security definer
-as
-$$
-declare
-    _file_id bigint;
-begin
-    select profile_picture_file_id
-    into _file_id
-    from users.user
-    where user_id = _user_id;
-
-    return files.generate_url(_file_id);
-end;
-$$;
-
-grant execute on function users.profile_picture_url(bigint) to authenticated;
-
 create function users.validate_create_user_input(_first_name text, _last_name text, _email text, _password text, _org_name text, _role users.user_role DEFAULT 'org_client') returns text
     language plpgsql
 as
@@ -1171,36 +1152,6 @@ end;
 $$;
 
 -- Files
-create or replace function files.generate_url(_file_id bigint) returns text
-    language plpgsql
-    security definer
-as
-$$
-declare
-    _file files.file;
-    _target_org_id bigint := auth.current_user_organization_id();
-    _organization_config organizations.organization_config := organizations.config_by_org_id(_target_org_id);
-begin
-    select *
-    into _file
-    from files.file
-    where file_id = _file_id
-    and organization_id = _target_org_id;
-
-    if not found then
-        return null;
-    end if;
-
-    return aws.generate_s3_presigned_url(
-        _organization_config.s3_bucket,
-        _file.object_key,
-        _organization_config.s3_region,
-        'GET',
-        360
-    );
-end;
-$$;
-
 create or replace function files.get_file_extension_from_mimetype(_mime_type text)
 returns text
 language plpgsql
@@ -6073,11 +6024,7 @@ create or replace function forms.form_question_answer(_form_question_id bigint) 
     security definer
 as
 $$
-declare
-    _organization_config organizations.organization_config;
 begin
-    _organization_config := organizations.config_by_org_id(auth.current_user_organization_id());
-
     return (
         select to_jsonb(fa) || jsonb_build_object(
             'answer_options', coalesce((
@@ -6092,13 +6039,6 @@ begin
                         'name', f.name,
                         'mime_type', f.mime_type,
                         'size', f.size,
-                        'url', aws.generate_s3_presigned_url(
-                            _organization_config.s3_bucket,
-                            f.object_key,
-                            _organization_config.s3_region,
-                            'GET',
-                            3600
-                        ),
                         'created_at', f.created_at,
                         'updated_at', f.updated_at
                     )
