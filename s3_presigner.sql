@@ -68,10 +68,74 @@ begin
     from files.file f
     where f.file_id = $1;
 
-    return to_jsonb(_file_details);
+    if not found then
+        return json_build_object(
+            'message', 'File not found'
+        );
+    end if;
+    
+    return json_build_object(
+            'file_id', _file_details.file_id,
+            'object_key', _file_details.object_key,
+            'bucket', _file_details.bucket,
+            'region', _file_details.region
+   );
 end;
 $$;
 
 grant execute on function services_api.file_details(bigint) to s3_presigner_service;
+
+create or replace function services_api.file_upload_details(
+    org_name text,
+    file_name text,
+    mime_type text,
+    purpose text,
+    parent_entity_id bigint default null
+) returns jsonb
+security definer
+language plpgsql
+as
+$$
+declare
+    _target_org_id bigint := organizations.org_id_by_org_name(org_name);
+    _org_config organizations.organization_config := organizations.config_by_org_id(_target_org_id);
+    _object_key text;
+begin
+    if purpose not in (
+        'profile_picture',
+        'organization_logo',
+        'form_answer_file',
+        'application_file'
+    ) then
+        raise exception 'File Upload Details Failed'
+            using
+                detail = 'Invalid purpose',
+                hint = 'invalid_purpose';
+    end if;
+
+    if _target_org_id is null then
+        raise exception 'File Upload Details Failed'
+            using
+                detail = 'Organization not found',
+                hint = 'organization_not_found';
+    end if;
+
+    _object_key := files.generate_object_key(
+        _target_org_id,
+        purpose,
+        mime_type,
+        file_name,
+        parent_entity_id
+    );
+
+    return jsonb_build_object(
+        'region', _org_config.s3_region,
+        'bucket', _org_config.s3_bucket,
+        'object_key', _object_key
+    );
+end;
+$$;
+
+grant execute on function services_api.file_upload_details(text, text, text, text, bigint) to s3_presigner_service;
 
 commit;

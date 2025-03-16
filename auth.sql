@@ -69,7 +69,6 @@ declare
     _user_id bigint;
     _organization_id bigint := organizations.org_id_by_org_name($2);
     _create_password_reset_token_result record;
-    _reset_password_email_result record;
 begin
     select user_id
     from users.user u
@@ -93,20 +92,12 @@ begin
                 hint = _create_password_reset_token_result.validation_failure_message;
     end if;
 
-    _reset_password_email_result := comms.send_email(
+    comms.create_email(
         'password@glovee.io',
         email,
         'Reset your password',
-        'You can reset your password by clicking the following link: ' || 'https://' || org_name || '.glovee.io/set-new-password?resetPasswordToken=' || (_create_password_reset_token_result.created_token).token,
-        _organization_id
+        'You can reset your password by clicking the following link: ' || 'https://' || org_name || '.glovee.io/set-new-password?resetPasswordToken=' || (_create_password_reset_token_result.created_token).token
     );
-
-    if _reset_password_email_result.failure_message is not null then
-        raise exception 'Forgot Password Failed'
-            using
-                detail = 'Invalid Request Payload',
-                hint = _reset_password_email_result.failure_message;
-    end if;
 
     return jsonb_build_object(
         'message', 'Password reset email sent'
@@ -222,7 +213,6 @@ declare
     _organization_id bigint := organizations.org_id_by_org_name(org_name);
     _reset_password_token auth.password_reset_token := auth.reset_password_token_by_token(reset_password_token);
     _update_user_password_result record;
-    _reset_password_success_email_result record;
 begin
     if _reset_password_token is null then
         raise exception 'Set New Password Failed'
@@ -247,20 +237,12 @@ begin
     delete from auth.password_reset_token
     where token = reset_password_token;
 
-    _reset_password_success_email_result := comms.send_email(
+    perform comms.create_email(
         'password@glovee.io',
         (_update_user_password_result.updated_user).email,
         'Password reset successful',
-        'Your password has been reset successfully',
-        _organization_id
+        'Your password has been reset successfully'
     );
-
-    if _reset_password_success_email_result.failure_message is not null then
-        raise exception 'Set New Password Failed'
-            using
-                detail = 'Invalid Request Payload',
-                hint = _reset_password_success_email_result.failure_message;
-    end if;
 
     return jsonb_build_object(
         'message', 'password_reset_success'

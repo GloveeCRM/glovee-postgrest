@@ -1218,6 +1218,7 @@ create or replace function files.generate_object_key(
     _parent_entity_id bigint default null
 ) returns text
     language plpgsql
+    security definer
 as $$
 declare
     _timestamp bigint := extract(epoch from now())::bigint::text;
@@ -1461,7 +1462,6 @@ declare
     _org_access_validation_failure_message text;
     _password text;
     _create_user_result record;
-    _send_email_response record;
     _reset_password_token_result record;
 begin
     _org_access_validation_failure_message := auth.validate_current_user_org_access(org_name);
@@ -1500,19 +1500,12 @@ begin
                 hint = _reset_password_token_result.validation_failure_message;
     end if;
 
-    _send_email_response := comms.send_email(
+    perform comms.create_email(
         'welcome@glovee.io',
         _create_user_result.created_user->>'email',
         'You are invited to join Glovee!',
         'You are invited to join Glovee. Please use the following link to setup your account: ' || 'https://' || org_name || '.glovee.io' || '/set-new-password?resetPasswordToken=' || (_reset_password_token_result.created_token).token
     );
-
-    if _send_email_response.failure_message is not null then
-        raise exception 'Client Creation Failed'
-            using
-                detail = 'Failed to send email',
-                hint = _send_email_response.failure_message;
-    end if;
 
     return jsonb_build_object(
         'user', _create_user_result.created_user
@@ -1610,6 +1603,7 @@ declare
     _object_key text;
     _org_config organizations.organization_config;
 begin
+
     if (_current_user_role = 'org_client' and user_id != _current_user_id)
     or (_current_user_role = 'org_admin' and _target_user_role != 'org_client' and user_id != _current_user_id) 
     or (_target_user_role = 'org_owner' and _current_user_role != 'org_owner') then
@@ -6817,7 +6811,3 @@ end;
 $$;
 
 grant execute on function api.update_application_form_status(bigint, text) to authenticated;
-
-
-
-drop function if exists comms.send_email(text, text, text, text);
