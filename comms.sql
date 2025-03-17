@@ -194,7 +194,8 @@ declare
     _task queues.task := queues.task_by_id(_task_id);
 begin
     update queues.task
-    set completed_at = now()
+    set completed_at = now(),
+        dequeued_at = null
     where task_id = _task_id
     returning * into completed_task;
 
@@ -249,6 +250,7 @@ begin
         update queues.task
         set 
             failed_at = now(),
+            dequeued_at = null,
             error_message = _error_message,
             metadata = _task_metadata,
             retries = _task.retries + 1
