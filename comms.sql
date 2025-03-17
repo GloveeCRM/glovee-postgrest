@@ -48,14 +48,28 @@ create table if not exists queues.task (
 
 create or replace function comms.email_with_status(
     _email_id bigint
-) returns record
-language sql
+) returns jsonb
+language plpgsql
 security definer
 as $$
-    select * from comms.email e
-    left join comms.email_status es 
-    using (email_id)
+declare
+    _email jsonb;
+begin
+    select to_jsonb(e)
+    into _email
+    from comms.email e
     where e.email_id = _email_id;
+
+    _email := _email || jsonb_build_object(
+        'status', (
+            select to_jsonb(es)
+            from comms.email_status es
+            where es.email_id = _email_id
+        )
+    );
+
+    return _email;
+end;
 $$;
 
 create or replace function queues.task_by_id(
@@ -131,13 +145,11 @@ begin
         _data := jsonb_build_object(
             _dequeued_task.task_type, 
             case _dequeued_task.task_type
-                when 'email' then to_jsonb(comms.email_with_status(_dequeued_task.resource_id))
-                else null
+                when 'email' then comms.email_with_status(_dequeued_task.resource_id)
             end
         );
 
-        result := jsonb_build_object(
-            'task', to_jsonb(_dequeued_task),
+        result := to_jsonb(_dequeued_task) || jsonb_build_object(
             'data', _data
         );
     else
